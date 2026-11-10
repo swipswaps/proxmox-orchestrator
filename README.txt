@@ -1,3 +1,3 @@
 PROXMOX REMOTE ORCHESTRATION ENGINE
-See .env for ports, container names, and reuse decisions.
-Monitoring compose uses project name 'repo-monitoring' (isolated).
+See .env for ports, container names, reuse decisions.
+Monitoring compose is regenerated each build — only non-skipped services appear.
