@@ -7,25 +7,36 @@ from proxmox_client import get_proxmox_connection, is_proxmox_configured
 
 app = FastAPI()
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+
 class DeploymentRequest(BaseModel):
     name: str; type: str; node: str; cores: int = 2; memory: int = 2048
+
 @app.on_event("startup")
 def startup_event(): init_db()
+
 @app.get("/api/health")
 def health(): return {"status": "ok"}
+
 @app.get("/api/status")
 def status():
-    configured = is_proxmox_configured(); connected = False; detail = ""
+    configured = is_proxmox_configured()
+    connected = False; detail = ""
     if configured:
-        try: get_proxmox_connection().version.get(); connected = True
-        except Exception as e: detail = str(e)
-    return {"backend":"ok","proxmox_configured":configured,"proxmox_connected":connected,"detail":detail}
+        try:
+            get_proxmox_connection().version.get()
+            connected = True
+        except Exception as e:
+            detail = f"{type(e).__name__}: {e}"
+    return {"backend":"ok","proxmox_configured":configured,
+            "proxmox_connected":connected,"detail":detail}
+
 @app.get("/api/nodes")
 def list_nodes():
     if not is_proxmox_configured():
         return {"nodes":[],"proxmox_available":False,"message":"Proxmox not configured"}
     try: return {"nodes": get_proxmox_connection().nodes.get(), "proxmox_available": True}
     except Exception as e: return {"nodes":[],"proxmox_available":False,"message":str(e)}
+
 @app.post("/api/deploy")
 def trigger_deployment(req: DeploymentRequest):
     if not is_proxmox_configured(): raise HTTPException(503, "Proxmox not configured")
@@ -43,7 +54,8 @@ def trigger_deployment(req: DeploymentRequest):
         for cmd, t in [(["terraform","init","-upgrade"], 120),
                        (["terraform","apply","-auto-approve"], 600)]:
             p = subprocess.Popen(cmd, cwd="/app/terraform", env=env,
-                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True)
+                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                 start_new_session=True)
             _, err = p.communicate(timeout=t)
             if p.returncode != 0: raise RuntimeError(err.decode())
         conn = get_db_connection()
@@ -55,6 +67,7 @@ def trigger_deployment(req: DeploymentRequest):
         conn.execute("UPDATE deployments SET status=? WHERE id=?", ("FAILED", dep_id))
         conn.commit(); conn.close()
         raise HTTPException(500, str(e))
+
 @app.get("/api/deployments")
 def get_deployments():
     conn = get_db_connection()

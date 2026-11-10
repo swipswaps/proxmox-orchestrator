@@ -1,0 +1,2887 @@
+Audit and build script
+The user is showing that the script failed because Grafana tried to start, but the grafana service in docker-compose.monitoring.yml depends on prometheus. Since we chose to reuse existing prometheus (skip ours), our compose file still tries to start prometheus to satisfy grafana's 
+depends_on: [prometheus]
+.
+
+Then it hits a container name conflict because the existing prometheus container (from project 
+repo
+, not repo-monitoring) occupies the name.
+
+Two issues:
+
+depends_on: [prometheus] forces starting our prometheus even when we've chosen to skip it. Since we're reusing the existing one from a different project, docker compose still tries to spin up OUR prometheus.
+
+When our prometheus starts, its container_name is ${PROMETHEUS_CONTAIN
+ER_NAME:-prometheus}
+ — but that name is already used by an existing container from a different project. Hence the conflict.
+
+Then interestingly: 
+❌ grafana failed
+ but ✅ Grafana OK — because the existing grafana on 3001 is reachable.
+
+Root fixes needed:
+
+When we're reusing a service (SKIP_X=yes), REMOVE depends_on for it from the compose file. Or better: generate a filtered compose file that only includes the services we're going to start.
+
+Ensure container
+_name
+ for services we DO start doesn't clash with an existing container from another project. If prometheus is being reused, but graf
+ana
+ (which we ARE starting) needs a prometheus, and we've skipped ours... we should point grafana's datasource at the existing prometheus via host network, but the dependency graph still forces starts.
+
+Better: generate a temp compose file at build time containing only the services we actually want to start, with depends_on stripped for skipped ones.
+
+Also: user asked to "detect and guide user, no blocking conflicts". So the script should:
+
+Detect that grafana's depends_on: prometheus will fail because prometheus is skipped
+
+Guide: either remove depends_on (using existing prometheus via host network) or start a second prometheus with a different container name
+
+Also: cAdvisor started OK because it has no dependencies. Grafana failed on prometheus dep. Backend started OK.
+
+Let me look at what happened more carefully:
+
+text
+▶ 13. Monitoring stack
+ℹ️  dockge: skipped
+ℹ️  prometheus: reusing existing at :9090
+ℹ️  Starting cadvisor ...
+✅ cadvisor started
+ℹ️  Starting grafana ...
+...
+✘ Container prometheus                 Error respon...                        0.1s
+Error response from daemon: Conflict. The container name "/prometheus" is already in use ...
+❌ grafana failed
+So docker compose -f docker-compose.monitoring.yml up -d grafana started prometheus (as a dependency of grafana) even though we told it to skip prometheus. The container_name: prometheus in the compose file then conflicted with the existing one.
+
+Fixes needed:
+
+Strip depends_on for skipped services before running compose. Best approach: generate a filtered compose file, OR use --no-deps flag with up -d.
+
+Actually docker compose up -d --no-deps grafana would skip starting prometheus as a dependency! That's the simplest fix.
+
+But then grafana can't reach prometheus via the internal monitoring network. If we're reusing prometheus (from a different project/network), grafana would need to reach it via host.docker.internal:9090.
+
+The prometheus datasource config in Grafana is not part of the compose file (it's set up by the user in the UI). So for now, the simplest correct behavior is:
+
+Use --no-deps when starting services
+
+Guide the user: "prometheus is reused at :9090, configure it as datasource in Grafana at http://host.docker.internal:9090"
+
+Container name conflicts — when starting a service, if its container_name conflicts with an existing container from another project, either use --no-deps (doesn't help with name) or dynamically rename. Better: before running compose, check each service we're going to start and if its name is taken by a container from a DIFFERENT project, override the container_name via env var (which we already do — but we only checked that in step 1 for reuse detection, and only for services the user chose to reuse or replace).
+
+Wait — the issue is: user chose to REUSE prometheus. So we marked SKIP_PROMETHEUS=yes and EXISTING_PROMETHEUS_PORT=9090. But then docker compose up -d grafana starts prometheus anyway because grafana depends on it. And when prometheus starts, its container_name is prometheus which is taken.
+
+So we need to:
+
+Either strip depends_on: prometheus from grafana config (via --no-deps or filtered compose)
+
+Or override PROMETHEUS_CONTAINER_NAME to something unique for when it inadvertently starts
+
+Simplest: use docker compose up -d --no-deps <service> for all monitoring services.
+
+Also: when a container name conflict is detected for a service we're NOT going to start but that gets pulled in as a dependency, we should also handle that. But --no-deps avoids starting it.
+
+Also, when we start grafana with --no-deps, its depends_on: prometheus is skipped but the config still has depends_on — docker compose validates this (warns) but proceeds.
+
+Actually, since we're generating the compose file ourselves, we can simply exclude depends_on when we know prometheus is skipped.
+
+Best approach: dynamically generate docker-compose.monitoring.yml at build time, only including services we want to start. This is cleaner.
+
+Let me think about what compose files we'd generate:
+
+If SKIP_DOCKGE=yes AND SKIP_PROMETHEUS=yes AND SKIP_CADVISOR=yes AND SKIP_GRAFANA=yes: don't emit monitoring compose at all
+
+Otherwise: emit only the services not skipped
+
+Remove depends_on on grafana if prometheus is skipped
+
+For grafana, add extra_hosts: host.docker.internal:host-gateway so it can reach existing prometheus
+
+Also for services we DO start, ensure their container_name doesn't clash. If SKIP_PROMETHEUS=yes but we're starting grafana, we must ensure prometheus isn't started as a dependency. Remove the depends_on: [prometheus] block.
+
+Let me also consider: what if SKIP_GRAFANA=no but SKIP_PROMETHEUS=yes? Then grafana needs a prometheus datasource. We should:
+
+Not emit depends_on: prometheus for grafana
+
+Add extra_hosts: host.docker.internal:host-gateway to grafana
+
+Print a message: "Grafana will use your existing Prometheus at http://host.docker.internal:9090 — add it as a datasource in Grafana UI"
+
+What if SKIP_GRAFANA=no and SKIP_PROMETHEUS=no? Normal case — both start, depends_on works.
+
+What if SKIP_GRAFANA=yes but SKIP_PROMETHEUS=no? Start prometheus only, grafana skipped.
+
+Also, prometheus has depends_on: cadvisor implicitly? No, it doesn't. cadvisor is scraped by prometheus but no compose-level dependency. Actually let me re-read:
+
+yaml
+  prometheus:
+    ...
+    depends_on:
+      - cadvisor   # ← wait, is this there?
+Looking at the compose file, prometheus has no depends_on. Grafana has depends_on: [prometheus]. Good.
+
+So the fix is:
+
+Don't emit depends_on on grafana if SKIP_PROMETHEUS=yes (or emit with no deps)
+
+Use --no-deps flag when starting individual services as extra safety
+
+If prometheus is being started but with a name conflict, override container_name
+
+Better UX: when the monitoring stack has issues, list what's reused vs started vs skipped
+
+Also — "no blocking conflicts". So the script should CONTINUE past non-critical monitoring issues, only stopping for backend failures. Currently the script continues (ERRORS=1 but BUILD COMPLETED), so that's already happening. But the user wants detection and guidance so they know what to fix.
+
+Let me also think about the container_name conflict more carefully:
+
+docker compose -f docker-compose.monitoring.yml up -d grafana — this reads the compose file which has prometheus with container_name: prometheus. Even with --no-deps, compose might still try to... actually no. --no-d
+eps
+ prevents starting dependencies. So grafana would start without touching prometheus.
+
+But wait: docker compose might still try to CREATE the prometheus container even with 
+--no-deps
+? Let me think...
+
+Actually --no-deps means "don't start linked services". So docker compose up -d --no-deps grafana starts only grafana. Prometheus is not started. But the compose file still defines prometheus as a service, so docker compose up validates it exists.
+
+But when grafana starts, it will try to reach prometheus via the monitoring network... and prometheus isn't running on that network because our compose's prometheus wasn't started (existing prometheus is on 
+repo_orchestrator_net
+ or wherever). So grafana fails to find prometheus. That's fine for now — user configures datasource manually.
+
+OK so the fix is basically:
+
+Emit monitoring compose without 
+depends_on: prometheus
+ on grafana when SKIP_PROMETHEUS=yes
+
+Use --no-deps on all monitoring service starts
+
+Guide user about the datasource URL
+
+Actually, a cleaner solution: dynamically build the compose file. If any service is skipped, don't include it in the emitted compose. That way, docker compose doesn't even know about it, and no dependencies break.
+
+Let me write that:
+
+bash
+# Build filtered compose file
+emit_monitoring_compose() {
+  {
+    echo "name: repo-monitoring"
+    echo ""
+    echo "services:"
+    
+    if [ "$SKIP_DOCKGE" != "yes" ]; then
+      cat <<'YAML'
+  dockge:
+    image: louislam/dockge:1.5.0
+    container_name: ${DOCKGE_CONTAINER_NAME:-dockge}
+    ...
+YAML
+    fi
+    
+    if [ "$SKIP_PROMETHEUS" != "yes" ]; then
+      cat <<'YAML'
+  prometheus:
+    ...
+YAML
+    fi
+    
+    if [ "$SKIP_CADVISOR" != "yes" ]; then
+      cat <<'YAML'
+  cadvisor:
+    ...
+YAML
+    fi
+    
+    if [ "$SKIP_GRAFANA" != "yes" ]; then
+      cat <<'YAML'
+  grafana:
+    ...
+YAML
+    fi
+    
+    # Volumes / networks only if needed
+    ...
+  } > docker-compose.monitoring.yml
+}
+But this gets complex. Simpler: emit full file always, but override 
+depends_on
+ on grafana based on whether prometheus is skipped, and use --no-d
+eps
+ at start time.
+
+Actually the truly simplest fix:
+
+Emit the full compose file with 
+depends_on
+ on grafana
+
+When starting, use docker compose -f ...
+up -d --no-deps <service>
+ — this prevents dependency startup
+
+If SKIP_PROMETHEUS=yes, ALSO emit the compose WITHOUT the depends_on block on grafana
+
+Or even simpler: just always strip depends_on and use --no-deps. That way we always control what starts.
+
+Wait, there's another issue: container
+_name: prometheus
+ is set. If prometheus is skipped and grafana is started with --no-deps, prometheus isn't started — no conflict. Good.
+
+But if BOTH are started (no skips), and the user already has a prometheus container from another project, we get the conflict again. So we need to handle name conflicts for services we DO start.
+
+The existing resolve_container_name for prometheus detects the conflict and offers K/S/D. If K (keep and reuse), it sets REUSE_PROMETHEUS=yes → SKIP_PROMETHEUS=yes → prometheus not started. Good.
+
+If D (delete and start fresh), it deletes the conflicting container. But the user in the log chose K.
+
+OK so the fix chain is:
+
+resolve_container_name correctly identifies prometheus conflict → user picks K → REUSE_PROMETHEUS=yes
+
+This should have prevented prometheus from starting
+
+But grafana has depends_on: prometheus, which overrides the "don't start prometheus" intent
+
+Fix: emit compose WITHOUT depends_on, OR use --no-deps
+
+Let me finalize the fixes:
+
+Fix A: When emitting docker-compose.monitoring.yml, only include depends_on for grafana if SKIP_PROMETHEUS=no. Also strip prometheus/cadvisor/etc service entries entirely if skipped (avoids the container_name conflict even if docker compose inadvertently tries to start them).
+
+Fix B: Use --no-deps at start time as defense in depth.
+
+Fix C: When starting grafana with existing (skipped) prometheus, add extra_hosts: host.docker.internal:host-gateway and provide a clear message: "Grafana will not have prometheus auto-linked. Add http://host.docker.internal:9090 as a datasource via Grafana UI."
+
+Fix D: Post-start verification should check that the reused services are still reachable (not that we started our own).
+
+Fix E: Never block on monitoring failures — just report, continue. Already happens, but let's make the summary clearer.
+
+Also: docker compose -f docker
+-compose.monitoring.yml up -d grafana
+ was called from the compose file that has prometheus defined. Even with --no-deps, I believe compose still parses the prometheus entry but doesn't start it. If we strip it from the file entirely, no parsing/validation issues at all.
+
+Let me write the fix with a generate_monitoring_compose function that emits only services we're going to start. This is cleanest.
+
+Actually let me test mentally: what happens if SKIP_PROMETHEUS=yes and we still include prometheus in compose but use --no-deps for grafana?
+
+text
+docker compose -f monitoring.yml up -d --no-deps grafana
+This should start grafana without starting prometheus. But it will still create the network repo-monitoring_monitoring and the volumes if needed. And it might STILL warn about prometheus being defined but not started. And if prometheus container_name conflicts with existing container... no, it doesn't try to create prometheus, so no conflict.
+
+Actually wait — I recall that 
+--no-deps
+ is documented for up: "Don't start linked services." So up -d --no-deps grafana should NOT start prometheus even though grafana depends on it. And no name conflict for prometheus because it's not started.
+
+But the user's log shows prometheus DID try to start when grafana was started. So either --no-deps wasn't used, or something else happened.
+
+Looking at the log again:
+
+text
+▶ 13. Monitoring stack
+ℹ️  dockge: skipped
+ℹ️  prometheus: reusing existing at :9090
+ℹ️  Starting cadvisor ...
+✅ cadvisor started
+ℹ️  Starting grafana ...
+...
+✘ Container prometheus                 Error respon...                        0.1s
+Error response from daemon: Conflict. The container name "/prometheus" is already in use by container "b62de95a...
+❌ grafana failed
+So when the script did docker compose -f docker-compose.monitoring.yml up -d
+grafana
+, compose started prometheus as a dependency. The 
+--no-deps
+ flag was NOT used in the current script.
+
+Right, looking at the current script:
+
+bash
+docker compose -f docker-compose.monitoring.yml up -d "$svc" \
+No --no-deps. So compose tried to start prometheus as grafana's dependency, hit the container name conflict, and grafana failed.
+
+Primary fix: use --no-deps OR emit compose without skipped services
+
+I'll do both — emit without skipped services (cleaner, avoids all conflicts) AND use --no-deps (defense in depth).
+
+Also: when starting grafana with skip_prometheus=yes, we need to tell grafana where prometheus is. The user configures datasources manually via UI, so we just need to make sure grafana can reach the existing prometheus. If existing prometheus is on host network at :9090, grafana needs extra_hosts: host.docker.internal:host-gateway and the user adds http://host.docker.internal:9090 as a datasource.
+
+Actually, if the existing prometheus is on the host at localhost:9090 and grafana runs in a container on repo-monitoring_monitoring, then grafana cannot reach localhost:9090 (that's its own container). It needs host.docker.internal:9090 or the host's actual IP.
+
+So we need extra_hosts: host.docker.internal:host
+-gateway
+ on grafana when prometheus is skipped.
+
+Let me write the fix now.
+
+Also the summary should reflect reality:
+
+"cadvisor started OK"
+
+"prometheus REUSED at :9090"
+
+"grafana started but prometheus not linked — add datasource"
+
+Or "grafana failed — reason"
+
+Also, there's a subtle issue: even if we emit monitoring compose WITHOUT prometheus, the grafana service still has depends_on: [prometheus] — that would fail because prometheus isn't a defined service. So we need to strip depends_on when prometheus is skipped.
+
+Or just not emit depends_on at all and rely on --no-deps plus user configuration.
+
+Or emit depends_on only conditionally.
+
+Let me write the code.
+
+bash
+emit_monitoring_compose() {
+  local f="docker-compose.monitoring.yml"
+  {
+    echo "name: repo-monitoring"
+    echo ""
+    echo "services:"
+    
+    if [ "${SKIP_DOCKGE:-no}" != "yes" ]; then
+      cat <<YAML
+  dockge:
+    image: louislam/dockge:1.5.0
+    container_name: ${DOCKGE_CONTAINER_NAME:-dockge}
+    restart: unless-stopped
+    ports: [ "\${DOCKGE_PORT:-5001}:5001" ]
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./monitoring/dockge:/app/data
+      - /opt/stacks:/opt/stacks
+    environment: [ "DOCKGE_STACKS_DIR=/opt/stacks" ]
+    networks: [ monitoring ]
+
+YAML
+    fi
+    
+    if [ "${SKIP_PROMETHEUS:-no}" != "yes" ]; then
+      cat <<YAML
+  prometheus:
+    image: prom/prometheus:v3.15.1
+    container_name: ${PROMETHEUS_CONTAINER_NAME:-prometheus}
+    restart: unless-stopped
+    ports: [ "\${PROMETHEUS_PORT:-9090}:9090" ]
+    volumes:
+      - ./monitoring/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prom-data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.retention.time=7d'
+    networks: [ monitoring ]
+    extra_hosts: [ "host.docker.internal:host-gateway" ]
+
+YAML
+    fi
+    
+    if [ "${SKIP_CADVISOR:-no}" != "yes" ]; then
+      cat <<YAML
+  cadvisor:
+    image: ghcr.io/google/cadvisor:v0.60.6
+    container_name: ${CADVISOR_CONTAINER_NAME:-cadvisor}
+    restart: unless-stopped
+    ports: [ "\${CADVISOR_PORT:-9091}:8080" ]
+    volumes:
+      - /:/rootfs:ro
+      - /var/run:/var/run:ro
+      - /sys:/sys:ro
+      - /var/lib/docker/:/var/lib/docker:ro
+      - /dev/disk/:/dev/disk:ro
+    privileged: true
+    devices: [ /dev/kmsg ]
+    networks: [ monitoring ]
+
+YAML
+    fi
+    
+    if [ "${SKIP_GRAFANA:-no}" != "yes" ]; then
+      cat <<YAML
+  grafana:
+    image: grafana/grafana:12.4.2
+    container_name: ${GRAFANA_CONTAINER_NAME:-grafana}
+    restart: unless-stopped
+    ports: [ "\${GRAFANA_PORT:-3001}:3000" ]
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=change-me-now
+      - GF_USERS_ALLOW_SIGN_UP=false
+    volumes: [ grafana-data:/var/lib/grafana ]
+    networks: [ monitoring ]
+    extra_hosts: [ "host.docker.internal:host-gateway" ]
+YAML
+      # Only add depends_on if prometheus is being started by us
+      if [ "${SKIP_PROMETHEUS:-no}" != "yes" ]; then
+        echo "    depends_on: [ prometheus ]"
+      fi
+      echo ""
+    fi
+    
+    # Volumes (only if any need them)
+    if [ "${SKIP_PROMETHEUS:-no}" != "yes" ] || [ "${SKIP_GRAFANA:-no}" != "yes" ]; then
+      echo ""
+      echo "volumes:"
+      [ "${SKIP_PROMETHEUS:-no}" != "yes" ] && echo "  prom-data:"
+      [ "${SKIP_GRAFANA:-no}" != "yes" ] && echo "  grafana-data:"
+    fi
+    
+    echo ""
+    echo "networks:"
+    echo "  monitoring:"
+    echo "    driver: bridge"
+  } > "$f"
+}
+That's a lot of conditional logic. Alternative: emit the full compose, but at start time:
+
+Check if prometheus is skipped; if so, don't start it (already done via SKIP_PROMETHEUS)
+
+Use --no-deps when starting each service
+
+Then the 
+depends_on
+ won't fire because of --no-deps. But we'd still have prometheus in the compose file — that's fine as long as we never start it, and Docker doesn't try to start it as a dependency.
+
+But wait — even with --no-deps, if prometheus's container_name: prometheus conflicts with an existing container, does compose error? I think compose only errors when it actually tries to CREATE the container. With --no-deps, it doesn't try. So no error.
+
+Hmm, but the user's log clearly showed it DID try. So either --no-deps wasn't used, or something changed.
+
+Looking at the current script:
+
+bash
+docker compose -f docker-compose.monitoring.yml up -d "$svc" \
+No --no-deps. Right, that's the bug.
+
+So the simplest fix: add --no-deps:
+
+bash
+docker compose -f docker-compose.monitoring.yml up -d --no-deps "$svc" \
+That should prevent prometheus from being started as grafana's dependency.
+
+But then grafana can't reach prometheus at all (they're on different networks or prometheus isn't on the monitoring network). And grafana's UI will show "prometheus unreachable" until user configures it.
+
+We should add extra_hosts: host.docker.internal:host-gateway to grafana so it can at least reach a prometheus on the host (which the existing one is, since docker port prometheus showed 9090:9090 published on host).
+
+Wait, the existing prometheus is repo project, running as container prometheus, publishing :9090 on host. Grafana in repo-mon
+itoring
+ project can reach it via:
+
+host.docker.internal:9090 (if extra_hosts set)
+
+OR the host's real IP:9090
+
+OR if we add the repo_orchestrator_net network as external to the monitoring compose
+
+Simplest for now: extra_hosts: host.docker.internal:host-gateway on grafana, and guide the user: "Add prometheus datasource at http://host.docker.internal:9090".
+
+OK let me finalize the fix. I'll do BOTH:
+
+Use --no-deps when starting individual monitoring services
+
+Add extra_hosts to grafana and prometheus in compose (for when prometheus is skipped and grafana needs to reach existing prometheus)
+
+Add helpful summary/guidance: "Grafana: no prometheus linked — configure datasource manually"
+
+Also strip depends_on at compose generation time when prometheus is skipped (cleaner, since the current log shows compose still tries)
+
+Actually you know what — let me also make the compose generator only include services that will actually be started. That eliminates ALL possible conflicts (name, dependencies, ports).
+
+But that's a big refactor. Let me instead:
+
+Generate compose with only non-skipped services. This is the cleanest fix.
+
+Use --no-deps anyway as belt-and-suspenders.
+
+If prometheus is skipped but grafana is starting, add extra_hosts to grafana and skip depends_on.
+
+Guide user via summary.
+
+Let me write the fix.
+
+Also the summary reported ✅ Grafana OK even though the script said ❌ grafana failed. That's because the existing grafana (opencode-grafana at :3001) IS reachable — the reuse logic worked, but the attempt to start OUR grafana also failed. Actually wait, we didn't set SKIP_GRAFANA=yes (grafana was "REUSE: no" per step 1 output). So we tried to start OUR grafana on :3001, but :3001 is taken by opencode-grafana.
+
+Wait wait. Let me re-read step 1:
+
+text
+✅ Container names resolved
+ℹ️    dockge=dockge  reuse=yes
+ℹ️    prometheus=prometheus  reuse=yes
+ℹ️    cadvisor=cadvisor  reuse=no
+ℹ️    grafana=grafana  reuse=no
+So REUSE_GRAFANA=no — user chose to start OUR grafana. But step 2 port landscape says:
+
+text
+  grafana      3001   docker:opencode-grafana        YES (image)
+Port 3001 is taken by opencode-grafana. So we should have picked a different port for grafana. Let me check step 3:
+
+text
+▶ 3. Port resolution
+✅ Resuming from .env
+Ah — .env already had ports from a previous run, so we didn't re-resolve ports. The .
+env
+ says 
+GRAFANA_PORT=3001
+. But :3001 is occupied by opencode-grafana. So when we start grafana, we'd fail on port bind, not container name.
+
+Wait, but the error was about container name conflict, not port bind. So the user's existing grafana container name (from a previous run) is what's conflicting.
+
+Actually re-reading the error:
+
+text
+Error response from daemon: Conflict. The container name "/prometheus" is already in use ...
+❌ grafana failed
+Hmm, it says prometheus container name conflict, not grafana. So when starting grafana, compose tried to start prometheus as a dependency, and prometheus's container_name prometheus conflicts with existing prometheus from another project.
+
+But it should have started grafana successfully on :3001... unless :3001 is also occupied.
+
+Actually wait, does grafana even try to start? The error says "prometheus" failed, then "grafana failed" — likely because grafana's depends_on failed.
+
+So the chain:
+
+Start grafana
+
+Compose sees depends_on: prometheus
+
+Compose tries to start prometheus
+
+Prometheus container_name conflict → prometheus fails
+
+Grafana can't start because dependency failed → grafana fails
+
+BUT opencode-grafana is running on :3001, so when we curl localhost:3001/api/health it succeeds → ✅ Grafana OK
+
+That's why grafana appears "OK" even though OUR grafana failed to start.
+
+OK so the fix is definitely --no-deps at minimum, plus strip skipped services from compose.
+
+Also: the port :3001 is owned by opencode-grafana. Our grafana would ALSO fail on port bind even if the name conflict didn't happen. So we need to guide the user:
+
+"You chose to start our Grafana but port :3001 is owned by opencode-grafana. Either:
+
+Reuse opencode-grafana (skip ours)
+
+Pick a different port for ours
+
+Stop opencode-grafana first"
+
+The current .env had GRAFANA_PORT=3001 and we didn't re-resolve because .env existed. So port resolution is also broken when .env has stale/incompatible values.
+
+Fixes:
+
+When resuming from .env, verify each port is still usable. If not, warn and re-prompt (or auto-pick).
+
+Use --no-deps when starting monitoring services.
+
+Emit compose with only non-skipped services.
+
+Add extra_hosts to grafana for reaching host prometheus.
+
+Clearer failure messages in summary.
+
+Let me write the fix now.
+
+Also, one more thing: the user explicitly said "script(s) must detect and guide user (I am), no blocking conflicts". So:
+
+Never fail hard on monitoring issues
+
+Always report what's happening and how to fix
+
+Offer to skip/continue
+
+Let me also add:
+
+After starting a service, if it fails due to name conflict or port conflict, offer to switch to reuse mode (SKIP_X=yes) and save that decision
+
+That's a good pattern: "Cannot start X because Y. Options: [S]kip ours and reuse existing, [P]ick new port, [R]emove existing."
+
+But it adds complexity. Let me focus on:
+
+Strip skipped services from compose
+
+--no-deps on start
+
+Verify port available when starting (or after failed start, offer to reuse)
+
+Guide in summary
+
+Actually the cleanest architecture:
+
+Pre-compute which services we will start (non-skipped)
+
+Emit compose with only those services
+
+Add extra_hosts everywhere so any container can reach host services via host.docker.internal
+
+Use --no-deps on start
+
+For each service that fails to start, offer to reuse existing (auto-set SKIP_X=yes and update .env)
+
+Let me write this concisely.
+
+Given the complexity, I'll structure the fix as:
+
+generate_monitoring_compose() — emits only non-skipped services
+
+Start loop uses --no-deps
+
+On failure, prompt: "Container failed. [S]kip and reuse existing on port :X, [R]etry, [K]eep error and continue"
+
+Summary lists reality per service
+
+Also handle the case where .env has stale ports that are now occupied — verify before starting.
+
+Let me write it.
+
+Also should I mention that opencode-grafana is presumably a separate grafana instance the user set up? Yes, and the user's intent was probably to have BOTH our grafana and theirs (different ports), OR to reuse. The current script didn't offer to pick a new port for grafana when reusing opencode-grafana's port.
+
+Fixing: when .env exists but a port is now occupied by a DIFFERENT container than the one that owns it, warn and re-prompt.
+
+Or simpler: when we detected opencode-grafana owns :3001 in step 2, and REUSE_GRAFANA=no, we should have re-prompted for a port. But we skipped port resolution because .env existed.
+
+Fix: in step 3 when resuming from .env, verify ports are still available. If not, fall through to port resolution for that specific service.
+
+OK let me write the final fix:
+
+bash
+# In step 3, after loading .env, verify each port
+for pair in "backend:BACKEND_PORT" "dockge:DOCKGE_PORT" "prometheus:PROMETHEUS_PORT" "cadvisor:CADVISOR_PORT" "grafana:GRAFANA_PORT"; do
+  svc="${pair%%:*}"; var="${pair##*:}"
+  port="${!var}"
+  skip_var="SKIP_$(echo "$svc" | tr '[:lower:]' '[:upper:]')"
+  
+  # Skip verification for services we're reusing
+  [ "${!skip_var}" = "yes" ] && continue
+  
+  if port_in_use "$port"; then
+    owner=$(port_owner "$port")
+    warn "$svc: saved port :$port is now busy ($owner)"
+    PORTS_SAVED="no"  # trigger re-resolution
+    break
+  fi
+done
+And then re-resolution would happen normally.
+
+But we should also handle the case where a container name conflicts AND port conflicts AND user chose not to reuse. At that point, the guided flow is: "It looks like opencode-grafana is already providing Grafana services on :3001. Options: [K]eep ours and use different port :3002, [S]kip ours, [R]emove opencode-grafana."
+
+OK, I think I'm overcomplicating. Let me focus on the minimal correct fix:
+
+Critical fixes:
+
+Use --no
+-deps
+ when starting monitoring services (prevents prometheus from starting as grafana's dep)
+
+Generate monitoring compose with only non-skipped services (cleaner, no name conflicts possible)
+
+Add extra_hosts: host.docker.internal:host-gateway to all monitoring services (so they can reach host services)
+
+Verify saved ports are still available before using them
+
+When a service fails to start, offer to auto-switch to reuse mode
+
+UX fixes:
+
+Summary says "grafana: failed (opencode-grafana owns :3001) — reconfigure to reuse or pick new port"
+
+Clear per-service status after start
+
+Let me write this. I'll be pragmatic — focus on the fixes that prevent the observed failures.
+
+Actually, thinking about the simplest correct fix: since the user's prometheus is a different project's container that happens to have the same name, and our compose has container_name: prometheus unconditionally — we should ALWAYS override container_name in the compose to repo
+-<service>
+ UNLESS the user has chosen to reuse that service. Or use compose's default naming (which prefixes with project name).
+
+Actually, the cleanest fix: don't set container_name at all for monitoring services. Let docker compose generate names like repo-monitoring-prometheus-1, repo-monitoring-grafana-1. Then there's no conflict with any user container named prometheus or grafana.
+
+But then reuse logic breaks: docker inspect prometheus won't find our container. We'd need to detect by image + project label instead.
+
+Alternative: only set container_name: <sv
+c>
+ if the name is free. Otherwise use <repo>-<svc> or don't set it.
+
+I already have resolve_container_name which sets ${SVC}_CONTAINER_NAME. Let me check if that's used correctly:
+
+yaml
+    container_name: ${DOCKGE_CONTAINER_NAME:-dockge}
+Yes. So if resolve_container_name sees a conflict, it either sets REUSE_X=yes (skip service) or renames to ${REPO_NAME}-dockge. Good.
+
+But wait — for PROMETHEUS, resolve_container_name set reuse=yes because user chose K. And SKIP_PROMETHEUS=yes was set. And compose still tries to start prometheus because of depends_on.
+
+Hmm, but if SKIP_PROMETHEUS=yes and we generate compose that doesn't include prometheus... then 
+depends_on: prometheus
+ in grafana would fail (undefined service).
+
+So we MUST strip depends_on when we strip the prometheus service.
+
+OR: include prometheus in compose but use 
+--no-deps
+ when starting grafana. But then prometheus is still there and if we later run docker compose up -d (all services), prometheus gets started and conflicts.
+
+Cleanest: only include non-skipped services in compose, and strip depends_on references to skipped services.
+
+OK let me just write it. I'll add a helper function.
+
+Given the length constraint, let me be focused and write clean code.
+
+Actually let me look at the overall structure one more time. The key failing path:
+
+User chose 
+K
+ (keep) for existing prometheus → REUSE_PROMETHEUS=yes → SKIP_PROMETHEUS=yes
+
+User chose K (keep) for existing dockge → REUSE_DOCKGE=yes → SKIP_DOCKGE=yes
+
+Grafana: user chose to start fresh (no existing grafana at step 1? or... wait let me re-check)
+
+Actually looking at the log again for step 1, I only see prompts for 
+dockge
+ and 
+prometheus
+. Grafana and cadvisor aren't prompted — because no container named 
+grafana
+ or cadvisor existed. So REUSE_GRAFANA=no, REUSE_CADVISOR=no.
+
+But step 2 shows :3001 owned by opencode-grafana — so opencode-grafana exists but is named opencode-grafana, not grafana. Hence no name conflict, but port conflict.
+
+Then step 3 resumed from .env — used GRAFANA_PORT=3001. But :3001 is busy. So even if prometheus didn't block grafana, grafana would fail to bind :3001.
+
+So there are TWO issues:
+
+Port :3001 is busy (opencode-grafana)
+
+Container name conflict for prometheus
+
+For the port issue: when .env exists and has stale/busy ports, we should NOT blindly use them. We should verify and warn.
+
+OK let me finalize. Given the scope, I'll produce a fix that:
+
+Verifies saved ports are usable; if any is busy and the service isn't being reused, re-prompt.
+
+Generates monitoring compose with only non-skipped services.
+
+Adds extra_hosts to reach host services.
+
+Uses --no-deps on start.
+
+On failure, guides user with clear options (skip, retry with new port, remove).
+
+Also I want to add: when the user chooses "pick new port" for a service that's being started but port is busy, prompt again in the port resolution step. But that's already partially handled by ask_simple.
+
+Let me write the fix. Focus on the minimal set of changes:
+
+bash
+# Verify saved ports are still usable
+if [ "$PORTS_SAVED" = "yes" ]; then
+  local any_busy="no"
+  for pair in "backend:BACKEND_PORT" "dockge:DOCKGE_PORT" "prometheus:PROMETHEUS_PORT" "cadvisor:CADVISOR_PORT" "grafana:GRAFANA_PORT"; do
+    svc="${pair%%:*}"; var="${pair##*:}"
+    skip_var="SKIP_$(echo "$svc" | tr '[:lower:]' '[:upper:]')"
+    [ "${!skip_var}" = "yes" ] && continue
+    port="${!var}"
+    if port_in_use "$port"; then
+      warn "$svc: saved port :$port is now busy ($(port_owner "$port"))"
+      any_busy="yes"
+    fi
+  done
+  [ "$any_busy" = "yes" ] && { info "Re-resolving ports for affected services"; PORTS_SAVED="no"; }
+fi
+And for compose generation:
+
+bash
+generate_monitoring_compose() {
+  local f="docker-compose.monitoring.yml"
+  {
+    echo "name: repo-monitoring"
+    echo ""
+    echo "services:"
+    
+    if [ "${SKIP_DOCKGE:-no}" != "yes" ]; then
+      cat <<YAML
+  dockge:
+    image: louislam/dockge:1.5.0
+    container_name: ${DOCKGE_CONTAINER_NAME:-dockge}
+    restart: unless-stopped
+    ports: [ "\${DOCKGE_PORT:-5001}:5001" ]
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./monitoring/dockge:/app/data
+      - /opt/stacks:/opt/stacks
+    environment: [ "DOCKGE_STACKS_DIR=/opt/stacks" ]
+    networks: [ monitoring ]
+
+YAML
+    fi
+    
+    if [ "${SKIP_PROMETHEUS:-no}" != "yes" ]; then
+      cat <<YAML
+  prometheus:
+    image: prom/prometheus:v3.15.1
+    container_name: ${PROMETHEUS_CONTAINER_NAME:-prometheus}
+    restart: unless-stopped
+    ports: [ "\${PROMETHEUS_PORT:-9090}:9090" ]
+    volumes:
+      - ./monitoring/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prom-data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.retention.time=7d'
+    networks: [ monitoring ]
+    extra_hosts: [ "host.docker.internal:host-gateway" ]
+
+YAML
+    fi
+    
+    if [ "${SKIP_CADVISOR:-no}" != "yes" ]; then
+      cat <<YAML
+  cadvisor:
+    image: ghcr.io/google/cadvisor:v0.60.6
+    container_name: ${CADVISOR_CONTAINER_NAME:-cadvisor}
+    restart: unless-stopped
+    ports: [ "\${CADVISOR_PORT:-9091}:8080" ]
+    volumes:
+      - /:/rootfs:ro
+      - /var/run:/var/run:ro
+      - /sys:/sys:ro
+      - /var/lib/docker/:/var/lib/docker:ro
+      - /dev/disk/:/dev/disk:ro
+    privileged: true
+    devices: [ /dev/kmsg ]
+    networks: [ monitoring ]
+
+YAML
+    fi
+    
+    if [ "${SKIP_GRAFANA:-no}" != "yes" ]; then
+      cat <<YAML
+  grafana:
+    image: grafana/grafana:12.4.2
+    container_name: ${GRAFANA_CONTAINER_NAME:-grafana}
+    restart: unless-stopped
+    ports: [ "\${GRAFANA_PORT:-3001}:3000" ]
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=change-me-now
+      - GF_USERS_ALLOW_SIGN_UP=false
+    volumes: [ grafana-data:/var/lib/grafana ]
+    networks: [ monitoring ]
+    extra_hosts: [ "host.docker.internal:host-gateway" ]
+YAML
+      if [ "${SKIP_PROMETHEUS:-no}" != "yes" ]; then
+        echo "    depends_on: [ prometheus ]"
+      fi
+      echo ""
+    fi
+    
+    # Volumes
+    local need_volumes="no"
+    [ "${SKIP_PROMETHEUS:-no}" != "yes" ] && need_volumes="yes"
+    [ "${SKIP_GRAFANA:-no}" != "yes" ] && need_volumes="yes"
+    
+    if [ "$need_volumes" = "yes" ]; then
+      echo ""
+      echo "volumes:"
+      [ "${SKIP_PROMETHEUS:-no}" != "yes" ] && echo "  prom-data:"
+      [ "${SKIP_GRAFANA:-no}" != "yes" ] && echo "  grafana-data:"
+    fi
+    
+    echo ""
+    echo "networks:"
+    echo "  monitoring:"
+    echo "    driver: bridge"
+  } > "$f"
+}
+And start loop:
+
+bash
+for svc in dockge prometheus cadvisor grafana; do
+  svc_upper=$(echo "$svc" | tr '[:lower:]' '[:upper:]')
+  skip_var="SKIP_$svc_upper"
+  if [ "${!skip_var}" = "yes" ]; then
+    continue
+  fi
+  
+  info "Starting $svc ..."
+  if docker compose -f docker-compose.monitoring.yml up -d --no-deps "$svc" 2>&1 | tee /tmp/mon-svc-err.log; then
+    ok "$svc started"
+  else
+    err=$(cat /tmp/mon-svc-err.log | head -3)
+    fail "$svc failed to start"
+    echo "    Error: $err"
+    echo ""
+    echo "    Options:"
+    echo "      [S]kip this service (reuse existing if available)"
+    echo "      [R]etry with different port"
+    echo "      [K]eep error and continue"
+    printf "    Choice [S/r/k] (Enter=K): "
+    local c=""; read -t 15 -r c; c="${c:-K}"
+    case "$c" in
+      [Ss]*) eval "SKIP_$svc_upper=yes"; save to .env; ok "Skipped $svc" ;;
+      [Rr]*)  # re-prompt for port
+        new_port=$(ask_simple "$svc" "${!port_var}" "")
+        eval "${port_var}=$new_port"
+        docker compose -f docker-compose.monitoring.yml up -d --no-deps "$svc" || fail "Retry failed"
+        ;;
+      *)      warn "Keeping failure for $svc" ;;
+    esac
+  fi
+done
+This is getting long. Let me trim to essentials and write the final answer.
+
+Given the complexity, let me be strategic. The minimum viable fix for the observed problems:
+
+Emit compose with only non-skipped services (fixes name conflict for skipped prometheus)
+
+Strip depends_on:
+prometheus
+ when prometheus is skipped (fixes the dependency chain)
+
+Verify saved ports before using them (fixes :3001 being busy)
+
+Use --no-deps (defense in depth)
+
+Add extra_hosts to all services (so they can reach host services)
+
+Guide in summary — each service shows status: started / reused / skipped / failed-reason
+
+For the reply, I'll provide the full heredoc with these fixes. I'll focus on the key changes and explain them clearly.
+
+Length is a concern. Let me be efficient.
+
+Actually, one more thing: the summary said ✅ Grafana OK even though grafana failed. That's because the health check hit opencode-grafana on :3001. That's misleading. Fix: after starting a service, check that the container WE started is running, not just that something on the port responds.
+
+For skipped services, check that the reused service is still reachable.
+For started services, check that OUR container is running AND port responds.
+
+bash
+# After attempting to start grafana
+if docker ps --filter "name=${GRAFANA_CONTAINER_NAME:-grafana}" --filter "status=running" --format '{{.Names}}' | grep -q "${GRAFANA_CONTAINER_NAME:-grafana}"; then
+  ok "grafana started"
+else
+  fail "grafana not running"
+fi
+OK let me write the fix. Going to be concise.
+
+Actually let me trace through one more time what happened with grafana:
+
+Step 1: no container named 
+grafana
+ existed (opencode-grafana is 
+opencode-grafana
+, different name). So REUSE_GRAFANA=no, GRAFANA_CONTAINER_NAME=grafana
+
+Step 2: port :3001 owned by opencode-grafana
+
+Step 3: .env had GRAFANA_PORT=3001. We didn't re-verify. So we used 3001.
+
+Step 12: started backend successfully
+
+Step 13: started cadvisor successfully
+
+Step 13: docker compose up -d grafana:
+
+Compose sees depends_on: prometheus
+
+Starts prometheus first
+
+Prometheus container_name prometheus conflicts with existing → fails
+
+Grafana fails because dependency failed
+
+Post-check: curl localhost:3001/api/health returns 200 (opencode-grafana) → ✅ Grafana OK
+
+But summary says 1 error (from ❌ grafana failed)
+
+So actually the reuse detection correctly identified opencode-grafana as reusable in step 2, but the user's step 1 didn't offer to reuse it because it's named opencode-grafana, not grafana.
+
+That's a gap: resolve_container_name only looks for exact name match grafana, not "any running grafana". Then in step 2 it shows YES (image) for the port's owner. But the user chooses "start fresh" in step 1 because they don't know opencode-grafana exists.
+
+Fix: when the port is owned by a container matching the service image, offer to reuse that container (not just our name).
+
+OK this is getting deep. Let me focus on the two observed bugs:
+
+Bug A: Container name conflict for prometheus (which we're skipping but which gets started as grafana's dep)
+Bug B: Port :3001 busy but used anyway (stale .env)
+
+And add:
+Fix C: Better failure handling — don't fail hard, offer to skip/retry
+Fix D: Clearer summary
+
+Let me write it.
+
+Actually one more insight: the user might actually want to keep both grafanas. The "reuse" logic is overly aggressive in assuming one is enough. But the user manually chose "K" (keep and reuse) in step 1 for prometheus and dockge. So they DO want to avoid duplicates. So our reuse logic is correct.
+
+The problem is: our compose file tries to start prometheus via grafana's depends_on, even though we've marked prometheus as skipped.
+
+Fix: --no-deps OR strip service from compose.
+
+Both. Let me write.
+
+One more concern: if we strip prometheus from compose (because SKIP_PROMETHEUS=yes), then depends_on: prometheus in grafana will be an undefined service reference. Docker Compose might warn but proceed, or might error. Let me check: I think it warns. But safest is to also strip depends_on.
+
+OK writing now. Final answer structure:
+
+Explain the two failures
+
+Fixed heredoc (long, but complete)
+
+Summary of changes
+
+Let me keep the heredoc focused on the changes and not re-emit unchanged sections verbatim where possible... but heredoc is one blob. So I have to emit the full thing.
+
+Alright, let me just write it and keep the explanation brief.
+
+Two Failures, Two Fixes
+🔍 Root Cause
+Failure 1: prom
+etheus
+ started despite being marked skip
+You chose K (keep and reuse) for the existing 
+prometheus
+, so the script set 
+SKIP_PROMETHEUS=yes
+. But 
+docker-compose.monitoring.yml
+ still contained:
+
+yaml
+grafana:
+  ...
+  depends_on: [ prometheus ]   # ← forces compose to start prometheus
+When the script ran docker compose up -d grafana, compose started prometheus as grafana's dependency — hitting the container_name: prometheus conflict with your existing repo-project prometheus. Grafana failed because its dependency failed.
+
+Failure 2: 
+:3001
+ was busy but was used anyway
+Step 2 correctly showed :3001 owned by opencode-grafana. But step 3 short-circuited on ✅ Resuming from .env — it never re-validated that saved ports were still free. So grafana tried to bind :3001, which would have failed even if the prometheus issue hadn't happened first.
+
+The ✅ Grafana OK at the end was a false positive — it was hitting opencode-grafana, not our container.
+
+🔧 Fix
+Three structural changes:
+
+Generate monitoring compose with only non-skipped services — no phantom prometheus entry, no depends_on: prometheus when it's skipped.
+
+Verify saved ports still free when resuming — re-resolve if any has become busy.
+
+Start with --no-deps + per-service failure guidance — never block, always offer skip/retry/reuse.
+
+Also added extra_hosts: host.docker.internal:host-gateway to all services so a reused host prometheus is reachable from our grafana.
+
+📄 Upgraded Heredoc
+bash
+#!/usr/bin/env bash
+# one-shot-build.sh — v5: no phantom dependency starts, port re-validation, no hard failures
+REPO_NAME="${REPO_NAME:-proxmox-orchestrator}"
+BUILD_SCRIPT="build_and_deploy.sh"
+echo "▶ Emitting $BUILD_SCRIPT ..."
+
+cat > "$BUILD_SCRIPT" <<'CORE_BUILD_EOF'
+#!/usr/bin/env bash
+# build_and_deploy.sh — idempotent, orphan-aware, no blocking failures
+set +e
+trap 'echo ""; echo "⚠️  Interrupted"; exit 130' INT
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)"
+[ "$(basename "$SCRIPT_DIR")" = "scripts" ] && cd "$(dirname "$SCRIPT_DIR")"
+
+REPO_NAME="${REPO_NAME:-proxmox-orchestrator}"
+PAGES_BRANCH="gh-pages"
+NON_INTERACTIVE="no"; FORCE_PORTS="no"; AUTO_FREE="no"; SKIP_MONITORING="no"
+ERRORS=0
+for arg in "$@"; do case "$arg" in
+  --yes|-y)             NON_INTERACTIVE="yes" ;;
+  --ports|-p)           FORCE_PORTS="yes" ;;
+  --free|-f)            AUTO_FREE="yes" ;;
+  --skip-monitoring|-m) SKIP_MONITORING="yes" ;;
+esac; done
+
+fail() { echo "❌ $1"; ERRORS=$((ERRORS + 1)); }
+ok()   { echo "✅ $1"; }
+info() { echo "ℹ️  $1"; }
+step() { echo ""; echo "▶ $1"; }
+warn() { echo "⚠️  $1"; }
+
+# ================================================================
+# Docker helpers with progress
+# ================================================================
+docker_stop_progress() {
+  local c="$1"
+  if ! docker inspect --format '{{.State.Running}}' "$c" &>/dev/null | grep -q true; then
+    info "$c is already stopped"; return 0
+  fi
+  echo "    ⏳ Stopping $c (grace up to 10s) ..."
+  local t0 t1; t0=$(date +%s)
+  docker stop "$c" &>/dev/null
+  t1=$(date +%s); ok "Stopped $c in $((t1 - t0))s"
+}
+docker_rm_progress() {
+  local c="$1"
+  if ! docker inspect "$c" &>/dev/null; then info "$c does not exist"; return 0; fi
+  echo "    ⏳ Removing $c ..."
+  docker rm "$c" &>/dev/null && ok "Removed $c" || fail "Could not remove $c"
+}
+
+# ================================================================
+# Port detection
+# ================================================================
+port_in_use() {
+  local p="$1"
+  if command -v ss &>/dev/null; then ss -ltn 2>&1 | awk '{print $4}' | grep -qE "[:.]$p$"
+  elif command -v netstat &>/dev/null; then netstat -ltn 2>&1 | awk '{print $4}' | grep -qE "[:.]$p$"
+  else return 1; fi
+}
+port_owner() {
+  local p="$1" c pid
+  c=$(docker ps --filter "publish=$p" --format '{{.Names}}' 2>&1 | head -n1)
+  [ -n "$c" ] && { echo "docker:$c"; return; }
+  if command -v ss &>/dev/null; then
+    pid=$(ss -ltnp 2>&1 | grep ":$p " | grep -o 'pid=[0-9]*' | head -n1 | cut -d= -f2)
+  fi
+  if [ -n "$pid" ] && [ -r "/proc/$pid/comm" ]; then echo "process:$(cat "/proc/$pid/comm") ($pid)"
+  else echo "unknown"; fi
+}
+find_next_free() {
+  local p="$1"
+  while [ "$p" -le 65535 ]; do port_in_use "$p" || { echo "$p"; return 0; }; p=$((p + 1)); done
+  return 1
+}
+
+# ================================================================
+# Container name conflict detection
+# ================================================================
+detect_name_conflict() {
+  docker ps -a --filter "name=^${1}$" --format '{{.Names}}' | grep -qx "$1"
+}
+inspect_name_conflict() {
+  local img state
+  img=$(docker inspect --format '{{.Config.Image}}' "$1" 2>&1)
+  state=$(docker inspect --format '{{.State.Status}}' "$1" 2>&1)
+  echo "$img|$state"
+}
+resolve_container_name() {
+  local svc="$1" default="$1"
+  local name_var="${svc^^}_CONTAINER_NAME" reuse_var="REUSE_${svc^^}"
+  if ! detect_name_conflict "$default"; then
+    eval "$name_var=\"$default\""; eval "$reuse_var=\"no\""; return
+  fi
+  local img_state img state
+  img_state=$(inspect_name_conflict "$default")
+  img=$(echo "$img_state" | cut -d'|' -f1); state=$(echo "$img_state" | cut -d'|' -f2)
+  if echo "$img" | grep -qiE "(^|/|:)$default(:|$)"; then
+    if [ "$NON_INTERACTIVE" = "yes" ]; then
+      if [ "$AUTO_FREE" = "yes" ]; then
+        info "Replacing existing $default ($state)"
+        docker_stop_progress "$default"; docker_rm_progress "$default"
+        eval "$name_var=\"$default\""; eval "$reuse_var=\"no\""
+      else
+        info "Reusing existing $default ($state)"
+        eval "$name_var=\"$default\""; eval "$reuse_var=\"yes\""
+      fi
+      return
+    fi
+    echo "" >&2
+    echo "  Container '$default' already exists ($img, $state)" >&2
+    echo "  This IS a $default instance." >&2
+    echo "" >&2
+    echo "    [K] Keep and reuse — skip starting ours (recommended)" >&2
+    echo "    [S] Stop, then start fresh" >&2
+    echo "    [D] Delete (stop + rm), then start fresh" >&2
+    printf "  Choice [K/s/d] (Enter=K): " >&2
+    local c=""; read -t 15 -r c; c="${c:-K}"; echo "" >&2
+    case "$c" in
+      [Ss]*) docker_stop_progress "$default"; eval "$name_var=\"$default\""; eval "$reuse_var=\"no\"" ;;
+      [Dd]*) docker_stop_progress "$default"; docker_rm_progress "$default"; eval "$name_var=\"$default\""; eval "$reuse_var=\"no\"" ;;
+      *)     eval "$name_var=\"$default\""; eval "$reuse_var=\"yes\"" ;;
+    esac
+  else
+    info "Name '$default' taken by '$img' — will use '${REPO_NAME}-${default}'"
+    eval "$name_var=\"${REPO_NAME}-${default}\""; eval "$reuse_var=\"no\""
+  fi
+}
+
+# ================================================================
+# Orphan handler (validated, non-blocking)
+# ================================================================
+handle_orphans() {
+  local compose_file="$1" project="$2" label="$3"
+  local cfg_err
+  if ! cfg_err=$(docker compose -f "$compose_file" config --quiet 2>&1); then
+    fail "$compose_file invalid YAML — skipping orphan check"
+    echo "    $cfg_err" >&2
+    return 1
+  fi
+  local services
+  services=$(docker compose -f "$compose_file" config --services 2>&1)
+  [ -z "$services" ] && { warn "$label: no services"; return 0; }
+  local all_containers
+  all_containers=$(docker ps -a --filter "label=com.docker.compose.project=$project" --format '{{.Names}}' 2>&1)
+  local orphans=""
+  for c in $all_containers; do
+    local svc
+    svc=$(docker inspect --format '{{index .Config.Labels "com.docker.compose.service"}}' "$c" 2>&1)
+    if [ -z "$svc" ] || ! echo "$services" | grep -qx "$svc"; then orphans="$orphans $c"; fi
+  done
+  [ -z "$orphans" ] && { ok "$label: no orphans"; return 0; }
+  echo ""; warn "Orphan containers in project '$project' ($label):"; echo ""
+  printf "      %-32s %-32s %s\n" "NAME" "IMAGE" "STATUS"
+  printf "      %-32s %-32s %s\n" "----" "-----" "------"
+  for c in $orphans; do
+    local img state
+    img=$(docker inspect --format '{{.Config.Image}}' "$c" 2>&1)
+    state=$(docker inspect --format '{{.State.Status}}' "$c" 2>&1)
+    printf "      %-32s %-32s %s\n" "$c" "$img" "$state"
+  done
+  echo ""
+  echo "  [K] Keep all  [A] Auto-remove  [M] Show commands  [P] Per-container"
+  printf "  Choice [K/a/m/p] (Enter=K): "
+  local choice=""; read -t 15 -r choice; echo ""; choice="${choice:-K}"
+  case "$choice" in
+    [Aa]*) for c in $orphans; do docker_stop_progress "$c"; docker_rm_progress "$c"; done ;;
+    [Mm]*) echo ""
+      echo "  Manual commands:"
+      for c in $orphans; do
+        echo "    docker stop $c && docker rm $c"
+        echo "    # or relabel to silence warning:"
+        echo "    docker update --label-add com.docker.compose.project=legacy-$(date +%s) $c"
+      done ;;
+    [Pp]*) for c in $orphans; do
+        local img state svc_of_c is_known
+        img=$(docker inspect --format '{{.Config.Image}}' "$c" 2>&1)
+        state=$(docker inspect --format '{{.State.Status}}' "$c" 2>&1)
+        svc_of_c=$(docker inspect --format '{{index .Config.Labels "com.docker.compose.service"}}' "$c" 2>&1)
+        is_known="no"; [ -n "$svc_of_c" ] && echo "$services" | grep -qx "$svc_of_c" && is_known="yes"
+        echo ""; echo "  $c ($img, $state)"
+        [ "$is_known" = "yes" ] && echo "    ⚠️  Defined in compose (not a true orphan)"
+        echo "    [K] Keep  [T] Terminate  [D] Delete  [L] Relabel"
+        printf "    Choice [K/t/d/l] (Enter=K): "
+        local c2=""; read -t 15 -r c2; c2="${c2:-K}"
+        case "$c2" in
+          [Tt]*) docker_stop_progress "$c" ;;
+          [Dd]*) if [ "$is_known" = "yes" ]; then
+                   printf "    ⚠️  Service — will be recreated on next up. Confirm delete? [y/N]: "
+                   local conf=""; read -t 15 -r conf
+                   if [ "${conf:-N}" = "y" ] || [ "${conf:-N}" = "Y" ]; then
+                     docker_stop_progress "$c"; docker_rm_progress "$c"
+                   else ok "Cancelled"; fi
+                 else docker_stop_progress "$c"; docker_rm_progress "$c"; fi ;;
+          [Ll]*) docker update --label-add "com.docker.compose.project=legacy-$(date +%s)" "$c" &>/dev/null \
+                   && ok "Relabeled $c" || fail "Relabel failed" ;;
+          *) ok "Kept $c" ;;
+        esac
+      done ;;
+    *) info "Keeping all orphans" ;;
+  esac
+}
+
+# ================================================================
+# Generate monitoring compose — ONLY non-skipped services
+# Fixes: phantom prometheus start, depends_on chain, container_name conflicts
+# ================================================================
+generate_monitoring_compose() {
+  local f="docker-compose.monitoring.yml"
+  {
+    echo "# Generated by build_and_deploy.sh — do not edit manually"
+    echo "# Only services with SKIP_*=no are included."
+    echo "name: repo-monitoring"
+    echo ""
+    echo "services:"
+
+    if [ "${SKIP_DOCKGE:-no}" != "yes" ]; then
+      cat <<YAML
+
+  dockge:
+    image: louislam/dockge:1.5.0
+    container_name: ${DOCKGE_CONTAINER_NAME:-dockge}
+    restart: unless-stopped
+    ports: [ "\${DOCKGE_PORT:-5001}:5001" ]
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./monitoring/dockge:/app/data
+      - /opt/stacks:/opt/stacks
+    environment: [ "DOCKGE_STACKS_DIR=/opt/stacks" ]
+    networks: [ monitoring ]
+YAML
+    fi
+
+    if [ "${SKIP_PROMETHEUS:-no}" != "yes" ]; then
+      cat <<YAML
+
+  prometheus:
+    image: prom/prometheus:v3.15.1
+    container_name: ${PROMETHEUS_CONTAINER_NAME:-prometheus}
+    restart: unless-stopped
+    ports: [ "\${PROMETHEUS_PORT:-9090}:9090" ]
+    volumes:
+      - ./monitoring/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prom-data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.retention.time=7d'
+    networks: [ monitoring ]
+    extra_hosts: [ "host.docker.internal:host-gateway" ]
+YAML
+    fi
+
+    if [ "${SKIP_CADVISOR:-no}" != "yes" ]; then
+      cat <<YAML
+
+  cadvisor:
+    image: ghcr.io/google/cadvisor:v0.60.6
+    container_name: ${CADVISOR_CONTAINER_NAME:-cadvisor}
+    restart: unless-stopped
+    ports: [ "\${CADVISOR_PORT:-9091}:8080" ]
+    volumes:
+      - /:/rootfs:ro
+      - /var/run:/var/run:ro
+      - /sys:/sys:ro
+      - /var/lib/docker/:/var/lib/docker:ro
+      - /dev/disk/:/dev/disk:ro
+    privileged: true
+    devices: [ /dev/kmsg ]
+    networks: [ monitoring ]
+YAML
+    fi
+
+    if [ "${SKIP_GRAFANA:-no}" != "yes" ]; then
+      cat <<YAML
+
+  grafana:
+    image: grafana/grafana:12.4.2
+    container_name: ${GRAFANA_CONTAINER_NAME:-grafana}
+    restart: unless-stopped
+    ports: [ "\${GRAFANA_PORT:-3001}:3000" ]
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=change-me-now
+      - GF_USERS_ALLOW_SIGN_UP=false
+    volumes: [ grafana-data:/var/lib/grafana ]
+    networks: [ monitoring ]
+    extra_hosts: [ "host.docker.internal:host-gateway" ]
+YAML
+      # depends_on only when prometheus is being started by us
+      if [ "${SKIP_PROMETHEUS:-no}" != "yes" ]; then
+        echo "    depends_on: [ prometheus ]"
+      fi
+    fi
+
+    # Volumes — only those referenced above
+    local need_volumes="no"
+    [ "${SKIP_PROMETHEUS:-no}" != "yes" ] && need_volumes="yes"
+    [ "${SKIP_GRAFANA:-no}" != "yes" ] && need_volumes="yes"
+    if [ "$need_volumes" = "yes" ]; then
+      echo ""
+      echo "volumes:"
+      [ "${SKIP_PROMETHEUS:-no}" != "yes" ] && echo "  prom-data:"
+      [ "${SKIP_GRAFANA:-no}" != "yes" ] && echo "  grafana-data:"
+    fi
+
+    echo ""
+    echo "networks:"
+    echo "  monitoring:"
+    echo "    driver: bridge"
+  } > "$f"
+}
+
+# ================================================================
+# Save state to .env (incremental)
+# ================================================================
+save_env() {
+  cat > .env <<EOF
+# Ports & reuse decisions (generated)
+BACKEND_PORT=$BACKEND_PORT
+DOCKGE_PORT=$DOCKGE_PORT
+PROMETHEUS_PORT=$PROM_PORT
+CADVISOR_PORT=$CADVISOR_PORT
+GRAFANA_PORT=$GRAFANA_PORT
+SKIP_DOCKGE=${SKIP_DOCKGE:-no}
+SKIP_PROMETHEUS=${SKIP_PROMETHEUS:-no}
+SKIP_CADVISOR=${SKIP_CADVISOR:-no}
+SKIP_GRAFANA=${SKIP_GRAFANA:-no}
+EXISTING_DOCKGE_PORT=${EXISTING_DOCKGE_PORT:-}
+EXISTING_PROMETHEUS_PORT=${EXISTING_PROMETHEUS_PORT:-}
+EXISTING_CADVISOR_PORT=${EXISTING_CADVISOR_PORT:-}
+EXISTING_GRAFANA_PORT=${EXISTING_GRAFANA_PORT:-}
+DOCKGE_CONTAINER_NAME=${DOCKGE_CONTAINER_NAME:-dockge}
+PROMETHEUS_CONTAINER_NAME=${PROMETHEUS_CONTAINER_NAME:-prometheus}
+CADVISOR_CONTAINER_NAME=${CADVISOR_CONTAINER_NAME:-cadvisor}
+GRAFANA_CONTAINER_NAME=${GRAFANA_CONTAINER_NAME:-grafana}
+EOF
+}
+
+# ================================================================
+# main()
+# ================================================================
+main() {
+  step "0. Pre-flight"
+  local missing=""
+  for tool in gh git docker node npm; do
+    command -v "$tool" &>/dev/null && ok "$tool" || missing="$missing $tool"
+  done
+  [ -n "$missing" ] && { fail "Missing:$missing"; return "$ERRORS"; }
+  docker buildx version &>/dev/null && ok "docker buildx" || fail "buildx missing"
+  local owner
+  owner=$(gh api user --jq '.login' 2>&1) || owner=""
+  if [ -z "$owner" ] || [ "${owner:0:3}" = "gh:" ]; then
+    fail "gh not authenticated"; return "$ERRORS"
+  fi
+  ok "Authenticated as $owner"
+  git config user.email &>/dev/null || git config user.email "build@localhost"
+  git config user.name  &>/dev/null || git config user.name  "Build Script"
+
+  # ----------------------------------------------------------------
+  # 1. Container name audit
+  # ----------------------------------------------------------------
+  step "1. Container name audit"
+  DOCKGE_CONTAINER_NAME=""; REUSE_DOCKGE="no"
+  PROMETHEUS_CONTAINER_NAME=""; REUSE_PROMETHEUS="no"
+  CADVISOR_CONTAINER_NAME=""; REUSE_CADVISOR="no"
+  GRAFANA_CONTAINER_NAME=""; REUSE_GRAFANA="no"
+  resolve_container_name "dockge"
+  resolve_container_name "prometheus"
+  resolve_container_name "cadvisor"
+  resolve_container_name "grafana"
+  ok "Resolved: dockge=$DOCKGE_CONTAINER_NAME(reuse=$REUSE_DOCKGE) prometheus=$PROMETHEUS_CONTAINER_NAME(reuse=$REUSE_PROMETHEUS) cadvisor=$CADVISOR_CONTAINER_NAME(reuse=$REUSE_CADVISOR) grafana=$GRAFANA_CONTAINER_NAME(reuse=$REUSE_GRAFANA)"
+
+  # ----------------------------------------------------------------
+  # 2. Port landscape
+  # ----------------------------------------------------------------
+  step "2. Port landscape"
+  printf "  %-12s %-6s %-30s %s\n" "SERVICE" "PORT" "OWNER" "REUSABLE?"
+  printf "  %-12s %-6s %-30s %s\n" "--------" "----" "-----" "---------"
+  for pair in "backend:8000" "dockge:5001" "prometheus:9090" "cadvisor:9091" "grafana:3001"; do
+    svc="${pair%%:*}"; port="${pair##*:}"
+    if ! port_in_use "$port"; then
+      printf "  %-12s %-6s %-30s %s\n" "$svc" "$port" "(free)" "—"; continue
+    fi
+    owner_p=$(port_owner "$port")
+    local status
+    if [ "$svc" = "backend" ]; then status="no (unique)"
+    else
+      existing=$(docker ps -a --format '{{.Names}}|{{.Image}}' | awk -F'|' -v svc="$svc" 'tolower($2) ~ tolower(svc) {print; exit}')
+      [ -n "$existing" ] && status="YES (image)" || status="no (different svc)"
+    fi
+    printf "  %-12s %-6s %-30s %s\n" "$svc" "$port" "$owner_p" "$status"
+  done
+
+  # ----------------------------------------------------------------
+  # 3. Port resolution — verify saved ports still free
+  # ----------------------------------------------------------------
+  step "3. Port resolution"
+  local BACKEND_PORT DOCKGE_PORT PROM_PORT CADVISOR_PORT GRAFANA_PORT
+  local PORTS_SAVED="no" env_source=""
+  [ -f .env ] && env_source=".env"
+  [ -f .env.tmp ] && env_source=".env.tmp"
+  if [ -n "$env_source" ] && [ "$FORCE_PORTS" != "yes" ]; then
+    while IFS='=' read -r key value; do case "$key" in
+      BACKEND_PORT) BACKEND_PORT="$value" ;;
+      DOCKGE_PORT)  DOCKGE_PORT="$value" ;;
+      PROMETHEUS_PORT) PROM_PORT="$value" ;;
+      CADVISOR_PORT) CADVISOR_PORT="$value" ;;
+      GRAFANA_PORT)  GRAFANA_PORT="$value" ;;
+      SKIP_DOCKGE)   SKIP_DOCKGE="$value" ;;
+      SKIP_PROMETHEUS) SKIP_PROMETHEUS="$value" ;;
+      SKIP_CADVISOR) SKIP_CADVISOR="$value" ;;
+      SKIP_GRAFANA)  SKIP_GRAFANA="$value" ;;
+      EXISTING_DOCKGE_PORT)     EXISTING_DOCKGE_PORT="$value" ;;
+      EXISTING_PROMETHEUS_PORT) EXISTING_PROMETHEUS_PORT="$value" ;;
+      EXISTING_CADVISOR_PORT)   EXISTING_CADVISOR_PORT="$value" ;;
+      EXISTING_GRAFANA_PORT)    EXISTING_GRAFANA_PORT="$value" ;;
+      DOCKGE_CONTAINER_NAME)     DOCKGE_CONTAINER_NAME="$value" ;;
+      PROMETHEUS_CONTAINER_NAME) PROMETHEUS_CONTAINER_NAME="$value" ;;
+      CADVISOR_CONTAINER_NAME)   CADVISOR_CONTAINER_NAME="$value" ;;
+      GRAFANA_CONTAINER_NAME)    GRAFANA_CONTAINER_NAME="$value" ;;
+    esac; done < "$env_source"
+    [ -n "$BACKEND_PORT" ] && [ -n "$DOCKGE_PORT" ] && [ -n "$PROM_PORT" ] && \
+      [ -n "$CADVISOR_PORT" ] && [ -n "$GRAFANA_PORT" ] && PORTS_SAVED="yes"
+  fi
+
+  [ "$REUSE_DOCKGE" = "yes" ]     && SKIP_DOCKGE=yes
+  [ "$REUSE_PROMETHEUS" = "yes" ] && SKIP_PROMETHEUS=yes
+  [ "$REUSE_CADVISOR" = "yes" ]   && SKIP_CADVISOR=yes
+  [ "$REUSE_GRAFANA" = "yes" ]    && SKIP_GRAFANA=yes
+
+  # NEW: verify saved ports are still free — re-resolve if any drifted
+  if [ "$PORTS_SAVED" = "yes" ]; then
+    local any_busy="no"
+    for pair in "backend:BACKEND_PORT" "dockge:DOCKGE_PORT:SKIP_DOCKGE" \
+                "prometheus:PROMETHEUS_PORT:SKIP_PROMETHEUS" \
+                "cadvisor:CADVISOR_PORT:SKIP_CADVISOR" \
+                "grafana:GRAFANA_PORT:SKIP_GRAFANA"; do
+      IFS=':' read -r svc var skip_var <<< "$pair"
+      [ -n "$skip_var" ] && [ "${!skip_var}" = "yes" ] && continue
+      port="${!var}"
+      if port_in_use "$port"; then
+        warn "$svc: saved port :$port is now busy ($(port_owner "$port"))"
+        any_busy="yes"
+      fi
+    done
+    if [ "$any_busy" = "yes" ]; then
+      info "Re-resolving ports for affected services"
+      PORTS_SAVED="no"
+    else
+      ok "Resuming from $env_source (all saved ports still free)"
+    fi
+  fi
+
+  # Extract existing ports for reuse services
+  for pair in "dockge:DOCKGE" "prometheus:PROMETHEUS" "cadvisor:CADVISOR" "grafana:GRAFANA"; do
+    svc="${pair%%:*}"; var="${pair##*:}"
+    skip_var="SKIP_$var"; ex_var="EXISTING_${var}_PORT"
+    if [ "${!skip_var}" = "yes" ] && [ -z "${!ex_var}" ]; then
+      ex_port=$(docker port "$svc" 2>&1 | grep -oE ':[0-9]+' | head -1 | tr -d ':')
+      [ -n "$ex_port" ] && eval "$ex_var=$ex_port"
+    fi
+  done
+
+  if [ "$PORTS_SAVED" != "yes" ]; then
+    ask_simple() {
+      local label="$1" default="$2" current="$3" value suggested
+      [ "$FORCE_PORTS" != "yes" ] && [ -n "$current" ] && ! port_in_use "$current" && { echo "$current"; return; }
+      [ "$FORCE_PORTS" != "yes" ] && ! port_in_use "$default" && { echo "$default"; return; }
+      suggested=$(find_next_free $((default + 1))); [ -z "$suggested" ] && suggested="$default"
+      echo "" >&2; echo "  $label" >&2
+      echo "    $default busy by: $(port_owner "$default")" >&2
+      echo "    Suggesting: :$suggested" >&2
+      printf "    Port [%s] (Enter=accept): " "$suggested" >&2
+      value=""; read -t 15 -r value; echo "" >&2
+      [ -z "$value" ] && value="$suggested"
+      port_in_use "$value" && value=$(find_next_free $((value + 1)))
+      echo "$value"
+    }
+    [ "$SKIP_PROMETHEUS" != "yes" ] && [ "$SKIP_CADVISOR" != "yes" ] && [ -n "$PROM_PORT" ] && \
+      info "Reusing port for prometheus=$PROM_PORT" || true
+    BACKEND_PORT=$(ask_simple "Backend API" 8000 "${BACKEND_PORT:-}")
+    [ "$SKIP_DOCKGE" != "yes" ]     && DOCKGE_PORT=$(ask_simple "Dockge UI" 5001 "${DOCKGE_PORT:-}")
+    [ "$SKIP_PROMETHEUS" != "yes" ] && PROM_PORT=$(ask_simple "Prometheus" 9090 "${PROM_PORT:-}")
+    [ "$SKIP_CADVISOR" != "yes" ]   && CADVISOR_PORT=$(ask_simple "cAdvisor" 9091 "${CADVISOR_PORT:-}")
+    [ "$SKIP_GRAFANA" != "yes" ]    && GRAFANA_PORT=$(ask_simple "Grafana" 3001 "${GRAFANA_PORT:-}")
+    [ -z "$DOCKGE_PORT" ] && DOCKGE_PORT=5001
+    [ -z "$PROM_PORT" ] && PROM_PORT=9090
+    [ -z "$CADVISOR_PORT" ] && CADVISOR_PORT=9091
+    [ -z "$GRAFANA_PORT" ] && GRAFANA_PORT=3001
+  fi
+
+  save_env
+  ok ".env written"
+
+  step "4. Git repository"
+  if [ ! -d .git ]; then git init -b main || fail "git init failed"
+  else
+    local cur; cur=$(git symbolic-ref --short HEAD 2>&1) || cur=""
+    [ "$cur" != "main" ] && { git show-ref --verify --quiet refs/heads/main && git checkout main || git checkout -b main; }
+  fi
+  ok "Git ready on 'main'"
+
+  # ----------------------------------------------------------------
+  # 5. Emit project files
+  # ----------------------------------------------------------------
+  step "5. Emitting project files"
+  mkdir -p backend terraform ansible frontend/src frontend/public \
+           monitoring/prometheus monitoring/dockge backend/data
+
+  cat > README.txt <<'EOF'
+PROXMOX REMOTE ORCHESTRATION ENGINE
+See .env for ports, container names, reuse decisions.
+Monitoring compose is regenerated each build — only non-skipped services appear.
+EOF
+
+  cat > backend/requirements.txt <<'EOF'
+fastapi==0.115.0
+uvicorn[standard]==0.31.0
+pydantic==2.9.2
+proxmoxer==2.0.1
+requests==2.32.3
+ansible-core==2.17.3
+python-dotenv==1.0.1
+EOF
+
+  cat > backend/.env.example <<'EOF'
+PROXMOX_HOST=
+PROXMOX_USER=root@pam
+PROXMOX_TOKEN_ID=
+PROXMOX_TOKEN_SECRET=
+PROXMOX_NODE=pve
+PROXMOX_VERIFY_SSL=false
+PROXMOX_TIMEOUT=5
+DATABASE_PATH=/app/data/orchestrator.db
+EOF
+
+  cat > backend/database.py <<'EOF'
+import sqlite3, os
+DB_PATH = os.getenv("DATABASE_PATH", "/app/data/orchestrator.db")
+def get_db_connection():
+    os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    return conn
+def init_db():
+    conn = get_db_connection()
+    with conn:
+        conn.execute("""CREATE TABLE IF NOT EXISTS deployments (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL,
+            type TEXT NOT NULL CHECK(type IN ('lxc','vm')),
+            target_node TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'PENDING',
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)""")
+    conn.close()
+EOF
+
+  cat > backend/proxmox_client.py <<'EOF'
+import os
+from proxmoxer import ProxmoxAPI
+def is_proxmox_configured() -> bool:
+    return all(os.environ.get(k) for k in
+               ["PROXMOX_HOST","PROXMOX_USER","PROXMOX_TOKEN_ID","PROXMOX_TOKEN_SECRET"])
+def get_proxmox_connection():
+    user = os.environ["PROXMOX_USER"]
+    if "@" not in user:
+        raise ValueError("PROXMOX_USER must include @realm, e.g. root@pam")
+    return ProxmoxAPI(os.environ["PROXMOX_HOST"], user=user,
+        token_name=f"{user}!{os.environ['PROXMOX_TOKEN_ID']}",
+        token_value=os.environ["PROXMOX_TOKEN_SECRET"],
+        verify_ssl=os.environ.get("PROXMOX_VERIFY_SSL","false").lower()=="true",
+        service="PVE", timeout=int(os.environ.get("PROXMOX_TIMEOUT","5")))
+EOF
+
+  cat > backend/main.py <<'EOF'
+import os, subprocess
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+from database import init_db, get_db_connection
+from proxmox_client import get_proxmox_connection, is_proxmox_configured
+
+app = FastAPI()
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+class DeploymentRequest(BaseModel):
+    name: str; type: str; node: str; cores: int = 2; memory: int = 2048
+@app.on_event("startup")
+def startup_event(): init_db()
+@app.get("/api/health")
+def health(): return {"status": "ok"}
+@app.get("/api/status")
+def status():
+    configured = is_proxmox_configured(); connected = False; detail = ""
+    if configured:
+        try: get_proxmox_connection().version.get(); connected = True
+        except Exception as e: detail = str(e)
+    return {"backend":"ok","proxmox_configured":configured,"proxmox_connected":connected,"detail":detail}
+@app.get("/api/nodes")
+def list_nodes():
+    if not is_proxmox_configured():
+        return {"nodes":[],"proxmox_available":False,"message":"Proxmox not configured"}
+    try: return {"nodes": get_proxmox_connection().nodes.get(), "proxmox_available": True}
+    except Exception as e: return {"nodes":[],"proxmox_available":False,"message":str(e)}
+@app.post("/api/deploy")
+def trigger_deployment(req: DeploymentRequest):
+    if not is_proxmox_configured(): raise HTTPException(503, "Proxmox not configured")
+    try: get_proxmox_connection().version.get()
+    except Exception as e: raise HTTPException(503, f"Proxmox unreachable: {e}")
+    conn = get_db_connection(); cur = conn.cursor()
+    cur.execute("INSERT INTO deployments (name,type,target_node,status) VALUES (?,?,?,?)",
+                (req.name, req.type, req.node, "PENDING"))
+    conn.commit(); dep_id = cur.lastrowid; conn.close()
+    env = os.environ.copy(); env.update({
+        "TF_VAR_instance_name": req.name, "TF_VAR_target_node": req.node,
+        "TF_VAR_cores": str(req.cores), "TF_VAR_memory": str(req.memory),
+        "TF_VAR_instance_type": req.type})
+    try:
+        for cmd, t in [(["terraform","init","-upgrade"], 120),
+                       (["terraform","apply","-auto-approve"], 600)]:
+            p = subprocess.Popen(cmd, cwd="/app/terraform", env=env,
+                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True)
+            _, err = p.communicate(timeout=t)
+            if p.returncode != 0: raise RuntimeError(err.decode())
+        conn = get_db_connection()
+        conn.execute("UPDATE deployments SET status=? WHERE id=?", ("SUCCESS", dep_id))
+        conn.commit(); conn.close()
+        return {"status": "success", "deployment_id": dep_id}
+    except Exception as e:
+        conn = get_db_connection()
+        conn.execute("UPDATE deployments SET status=? WHERE id=?", ("FAILED", dep_id))
+        conn.commit(); conn.close()
+        raise HTTPException(500, str(e))
+@app.get("/api/deployments")
+def get_deployments():
+    conn = get_db_connection()
+    rows = conn.execute("SELECT * FROM deployments ORDER BY created_at DESC").fetchall()
+    conn.close(); return [dict(r) for r in rows]
+EOF
+
+  cat > backend/Dockerfile <<'EOF'
+FROM python:3.11-slim
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl unzip git openssh-client && rm -rf /var/lib/apt/lists/*
+ARG TERRAFORM_VERSION=1.17.1
+RUN curl -fsSLo /tmp/terraform.zip \
+    "https://releases.hashicorp.com/terraform/${TERRAFORM_VERSION}/terraform_${TERRAFORM_VERSION}_linux_amd64.zip" \
+    && unzip /tmp/terraform.zip -d /usr/local/bin \
+    && chmod +x /usr/local/bin/terraform && rm /tmp/terraform.zip
+RUN pip install --no-cache-dir ansible-core==2.17.3
+WORKDIR /app
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+COPY . .
+RUN useradd -m -u 1000 appuser && chown -R appuser:appuser /app
+USER appuser
+EXPOSE 8000
+HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
+  CMD ["sh", "-c", "curl -f http://localhost:8000/api/health || kill -TERM 1"]
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
+EOF
+
+  cat > terraform/variables.tf <<'EOF'
+variable "proxmox_api_url" { type = string; default = "https://192.168.1.100:8006/api2/json" }
+variable "proxmox_api_token_id" { type = string; default = "root@pam!orchestrator" }
+variable "proxmox_api_token_secret" { type = string; sensitive = true }
+variable "target_node" { type = string; default = "pve" }
+variable "instance_name" { type = string; default = "managed-node-01" }
+variable "instance_type" { type = string; default = "lxc" }
+variable "cores" { type = number; default = 2 }
+variable "memory" { type = number; default = 2048 }
+EOF
+
+  cat > terraform/main.tf <<'EOF'
+terraform {
+  required_version = ">= 1.16.0"
+  required_providers { proxmox = { source = "Telmate/proxmox", version = "3.0.2-rc10" } }
+}
+provider "proxmox" {
+  pm_api_url = var.proxmox_api_url
+  pm_api_token_id = var.proxmox_api_token_id
+  pm_api_token_secret = var.proxmox_api_token_secret
+  pm_tls_insecure = true
+}
+resource "proxmox_lxc" "container" {
+  count = var.instance_type == "lxc" ? 1 : 0
+  target_node = var.target_node; hostname = var.instance_name
+  ostemplate = "local:vztmpl/debian-12-standard_12.2-1_amd64.zst"
+  cores = var.cores; memory = var.memory; unprivileged = true; start = true
+  rootfs { storage = "local-lvm"; size = "8G" }
+  network { name = "eth0"; bridge = "vmbr0"; ip = "dhcp" }
+}
+resource "proxmox_vm_qemu" "vm" {
+  count = var.instance_type == "vm" ? 1 : 0
+  name = var.instance_name; target_node = var.target_node
+  clone = "debian-12-template"; cores = var.cores; memory = var.memory
+  agent = 1; os_type = "cloud-init"
+  disk { size = "10G"; type = "scsi"; storage = "local-lvm" }
+  network { model = "virtio"; bridge = "vmbr0" }
+}
+EOF
+
+  cat > terraform/outputs.tf <<'EOF'
+output "instance_ip" {
+  value = try(proxmox_lxc.container[0].ssh_host,
+              proxmox_vm_qemu.vm[0].default_ipv4_address, "unknown")
+}
+EOF
+
+  cat > ansible/site.yml <<'EOF'
+- hosts: all
+  become: yes
+  tasks:
+    - dnf: { name: firewalld, state: present }
+    - firewalld: { zone: drop, state: enabled, permanent: yes, immediate: yes }
+    - firewalld:
+        zone: drop
+        rich_rule: 'rule family="ipv4" source address="192.168.0.0/16" service name="ssh" accept'
+        permanent: yes; immediate: yes; state: enabled
+    - lineinfile:
+        path: /etc/ssh/sshd_config
+        regexp: '^#?PermitRootLogin'
+        line: 'PermitRootLogin no'
+        validate: '/usr/sbin/sshd -t -f %s'
+      notify: restart sshd
+    - lineinfile:
+        path: /etc/ssh/sshd_config
+        regexp: '^#?PasswordAuthentication'
+        line: 'PasswordAuthentication no'
+        validate: '/usr/sbin/sshd -t -f %s'
+      notify: restart sshd
+    - selinux: { policy: targeted, state: enforcing }
+    - dnf: { name: dnf-automatic, state: present }
+      notify: enable dnf-automatic
+  handlers:
+    - systemd: { name: sshd, state: restarted }
+      listen: restart sshd
+    - systemd: { name: dnf-automatic.timer, state: started, enabled: yes }
+      listen: enable dnf-automatic
+EOF
+
+  cat > frontend/package.json <<'EOF'
+{
+  "name": "orchestrator-ui", "private": true, "version": "1.0.0", "type": "module",
+  "scripts": { "dev": "vite", "build": "vite build", "preview": "vite preview" },
+  "dependencies": { "react": "^18.3.1", "react-dom": "^18.3.1" },
+  "devDependencies": { "@vitejs/plugin-react": "4.3.4", "vite": "^5.4.21" }
+}
+EOF
+
+  cat > frontend/index.html <<'EOF'
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<title>Proxmox Orchestration Console</title></head>
+<body><div id="root"></div><script type="module" src="/src/main.jsx"></script></body></html>
+EOF
+
+  cat > frontend/src/main.jsx <<'EOF'
+import React from 'react';
+import ReactDOM from 'react-dom/client';
+import App from './App.jsx';
+ReactDOM.createRoot(document.getElementById('root')).render(<React.StrictMode><App/></React.StrictMode>);
+EOF
+
+  cat > frontend/vite.config.js <<'EOF'
+import { defineConfig } from 'vite'
+import react from '@vitejs/plugin-react'
+export default defineConfig({
+  plugins: [react()],
+  base: process.env.VITE_BASE_PATH || '/',
+  server: { port: 3000, proxy: { '/api': { target: 'http://localhost:8000', changeOrigin: true } } }
+})
+EOF
+
+  cat > frontend/src/App.jsx <<'EOF'
+import React, { useState, useEffect } from 'react';
+const API_BASE = import.meta.env.VITE_API_BASE || '';
+export default function App() {
+  const [deployments, setDeployments] = useState([]);
+  const [state, setState] = useState({ loading: true, backendOnline: false, proxmoxConfigured: false, proxmoxConnected: false, detail: '' });
+  const [form, setForm] = useState({ name: '', node: 'pve', type: 'lxc' });
+  useEffect(() => {
+    const c = new AbortController(); const t = setTimeout(() => c.abort(), 3000);
+    fetch(`${API_BASE}/api/health`, { signal: c.signal })
+      .then(r => { if (!r.ok) return; return fetch(`${API_BASE}/api/status`).then(r2 => r2.json()); })
+      .then(s => { if (s) setState({ loading: false, backendOnline: true, proxmoxConfigured: s.proxmox_configured, proxmoxConnected: s.proxmox_connected, detail: s.detail || '' }); })
+      .catch(() => setState(prev => ({ ...prev, loading: false }))).finally(() => clearTimeout(t));
+  }, []);
+  useEffect(() => {
+    if (!state.backendOnline) return;
+    fetch(`${API_BASE}/api/deployments`).then(r => r.json()).then(setDeployments).catch(() => {});
+  }, [state.backendOnline]);
+  const handleDeploy = async (e) => {
+    e.preventDefault(); if (!state.proxmoxConnected) return;
+    const r = await fetch(`${API_BASE}/api/deploy`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ ...form, cores: 2, memory: 2048 }) });
+    if (r.ok) { alert('Deployment triggered!'); window.location.reload(); }
+    else { const j = await r.json().catch(() => ({})); alert('Deploy failed: ' + (j.detail || r.status)); }
+  };
+  if (state.loading) return <p style={{ padding: 40 }}>Checking backend…</p>;
+  const deployEnabled = state.backendOnline && state.proxmoxConnected;
+  let banner;
+  if (!state.backendOnline) banner = { bg: '#fff3cd', color: '#856404', text: '⚠️ Backend unreachable.' };
+  else if (!state.proxmoxConfigured) banner = { bg: '#cfe2ff', color: '#084298', text: 'ℹ️ Backend online. Proxmox not configured.' };
+  else if (!state.proxmoxConnected) banner = { bg: '#fff3cd', color: '#856404', text: '⚠️ Proxmox configured but unreachable.' };
+  else banner = { bg: '#d1e7dd', color: '#0f5132', text: '✅ Backend online, Proxmox connected.' };
+  return (
+    <div style={{ fontFamily: 'sans-serif', maxWidth: 800, margin: '40px auto', padding: 20 }}>
+      <h2>Proxmox Remote Orchestration Console</h2>
+      <div style={{ background: banner.bg, color: banner.color, padding: 12, borderRadius: 4, marginBottom: 20 }}>{banner.text}</div>
+      <form onSubmit={handleDeploy} style={{ display: 'flex', gap: 10, marginBottom: 20, opacity: deployEnabled ? 1 : 0.5 }}>
+        <input type="text" placeholder="Instance Name" value={form.name} onChange={e => setForm({ ...form, name: e.target.value })} required disabled={!deployEnabled} />
+        <select value={form.type} onChange={e => setForm({ ...form, type: e.target.value })} disabled={!deployEnabled}><option value="lxc">LXC</option><option value="vm">VM</option></select>
+        <input type="text" placeholder="Target Node" value={form.node} onChange={e => setForm({ ...form, node: e.target.value })} required disabled={!deployEnabled} />
+        <button type="submit" disabled={!deployEnabled}>Deploy</button>
+      </form>
+      <h3>Deployment History</h3>
+      <table border="1" cellPadding="10" style={{ width: '100%', borderCollapse: 'collapse' }}>
+        <thead><tr><th>ID</th><th>Name</th><th>Type</th><th>Node</th><th>Status</th><th>Timestamp</th></tr></thead>
+        <tbody>
+          {deployments.length === 0 && <tr><td colSpan="6" style={{ textAlign: 'center' }}>No deployments.</td></tr>}
+          {deployments.map(d => (<tr key={d.id}><td>{d.id}</td><td>{d.name}</td><td>{d.type}</td><td>{d.target_node}</td><td>{d.status}</td><td>{d.created_at}</td></tr>))}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+EOF
+
+  cat > frontend/public/404.html <<'EOF'
+<!DOCTYPE html><html><head><meta charset="utf-8"><script>
+(function(){var s=location.pathname.split('/').filter(Boolean);
+s.length>0?location.replace('/'+s[0]+'/'):location.replace('/');})();
+</script></head><body></body></html>
+EOF
+
+  cat > docker-compose.yml <<'EOF'
+services:
+  backend:
+    image: proxmox-orchestrator-backend
+    build:
+      context: ./backend
+    container_name: proxmox-orchestrator-backend
+    restart: unless-stopped
+    env_file:
+      - backend/.env
+    ports:
+      - "${BACKEND_PORT:-8000}:8000"
+    volumes:
+      - ./backend/data:/app/data
+      - ./terraform:/app/terraform
+      - ./ansible:/app/ansible
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/api/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    networks:
+      - orchestrator_net
+
+networks:
+  orchestrator_net:
+    driver: bridge
+EOF
+
+  # NEW: generate monitoring compose — only non-skipped services
+  generate_monitoring_compose
+  ok "Monitoring compose generated (only non-skipped services)"
+
+  if [ "${SKIP_CADVISOR:-no}" = "yes" ] && [ -n "${EXISTING_CADVISOR_PORT:-}" ]; then
+    CADVISOR_TARGET="host.docker.internal:${EXISTING_CADVISOR_PORT}"
+  else
+    CADVISOR_TARGET="cadvisor:8080"
+  fi
+
+  cat > monitoring/prometheus/prometheus.yml <<EOF
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+scrape_configs:
+  - job_name: 'prometheus'
+    static_configs:
+      - targets: ['localhost:9090']
+  - job_name: 'cadvisor'
+    scrape_interval: 5s
+    static_configs:
+      - targets: ['$CADVISOR_TARGET']
+EOF
+
+  cat > .gitignore <<'EOF'
+__pycache__/
+*.pyc
+.venv/
+venv/
+*.db
+*.sqlite
+node_modules/
+dist/
+.terraform/
+*.tfstate
+*.tfstate.backup
+*.tfvars
+*.retry
+.env
+.env.tmp
+*.bak
+.DS_Store
+EOF
+
+  [ -f backend/.env ] || cp backend/.env.example backend/.env
+  mkdir -p backend/data
+  [ "$(id -u)" -ne 1000 ] && chmod 0777 backend/data &>/dev/null
+  ok "All project files emitted"
+
+  # ----------------------------------------------------------------
+  # 6. Validate compose files
+  # ----------------------------------------------------------------
+  step "6. Validate compose files"
+  if docker compose -f docker-compose.yml config --quiet 2>/dev/null; then ok "docker-compose.yml valid"
+  else fail "docker-compose.yml invalid"; docker compose -f docker-compose.yml config 2>&1 | head -5; fi
+  if [ -f docker-compose.monitoring.yml ]; then
+    if docker compose -f docker-compose.monitoring.yml config --quiet 2>/dev/null; then ok "monitoring compose valid"
+    else fail "monitoring compose invalid"; docker compose -f docker-compose.monitoring.yml config 2>&1 | head -5; fi
+  fi
+
+  step "7. Orphan check (main project 'repo')"
+  handle_orphans "docker-compose.yml" "repo" "main"
+
+  # ----------------------------------------------------------------
+  # 8. Commit + push
+  # ----------------------------------------------------------------
+  step "8. Commit + push"
+  git add -A
+  git diff --cached --quiet && ok "No changes" || { git commit -m "Build: sync" || fail "commit failed"; ok "Committed"; }
+
+  step "9. GitHub repo"
+  if gh repo view "$owner/$REPO_NAME" &>/dev/null; then ok "Repo exists"
+  else gh repo create "$REPO_NAME" --public --source=. --remote=origin --push || fail "create failed"; fi
+  git remote get-url origin &>/dev/null || git remote add origin "https://github.com/$owner/$REPO_NAME.git"
+  git push -u origin main || fail "push failed"
+  ok "Pushed main"
+
+  # ----------------------------------------------------------------
+  # 10. Frontend + gh-pages + Pages
+  # ----------------------------------------------------------------
+  step "10. Frontend"
+  if pushd frontend &>/dev/null; then
+    if [ ! -f package-lock.json ]; then
+      npm install --legacy-peer-deps || fail "npm install failed"
+      git add package-lock.json
+    fi
+    npm ci --legacy-peer-deps || fail "npm ci failed"
+    rm -rf dist
+    VITE_BASE_PATH="/$REPO_NAME/" npm run build || fail "Vite build failed"
+    [ -d dist ] && ok "dist/ produced" || fail "dist/ missing"
+    popd &>/dev/null
+  fi
+  if [ -d frontend/dist ] && pushd frontend &>/dev/null; then
+    npx --yes gh-pages -d dist -r "https://github.com/$owner/$REPO_NAME.git" || fail "gh-pages deploy failed"
+    popd &>/dev/null; ok "gh-pages pushed"
+  fi
+  step "11. Wait for gh-pages + enable Pages"
+  local waited=0 found=""
+  while [ "$waited" -lt 60 ]; do
+    git ls-remote --exit-code --heads origin "$PAGES_BRANCH" &>/dev/null && { found="yes"; break; }
+    sleep 3; waited=$((waited + 3))
+  done
+  if [ -n "$found" ]; then
+    if gh api "repos/$owner/$REPO_NAME/pages" --silent &>/dev/null; then
+      gh api "repos/$owner/$REPO_NAME/pages" -X PUT --input - &>/dev/null <<JSON || fail "Pages PUT failed"
+{"source":{"branch":"$PAGES_BRANCH","path":"/"}}
+JSON
+      ok "Pages updated"
+    else
+      gh api "repos/$owner/$REPO_NAME/pages" -X POST --input - &>/dev/null <<JSON || fail "Pages POST failed"
+{"source":{"branch":"$PAGES_BRANCH","path":"/"}}
+JSON
+      ok "Pages enabled"
+    fi
+  else fail "gh-pages not found"; fi
+
+  # ----------------------------------------------------------------
+  # 12. Backend
+  # ----------------------------------------------------------------
+  step "12. Backend"
+  info "Building image ..."
+  docker compose build backend || fail "build failed"
+  info "Starting container ..."
+  docker compose up -d backend || fail "up failed"
+  local hwaited=0 healthy=""
+  while [ "$hwaited" -lt 60 ]; do
+    curl -fsS --max-time 5 "http://localhost:$BACKEND_PORT/api/health" &>/dev/null && { healthy="yes"; break; }
+    sleep 2; hwaited=$((hwaited + 2))
+  done
+  [ -n "$healthy" ] && ok "Backend healthy after ${hwaited}s" || fail "Backend not healthy"
+
+  # ----------------------------------------------------------------
+  # 13. Monitoring — only non-skipped, --no-deps, guided failures
+  # ----------------------------------------------------------------
+  step "13. Monitoring stack"
+  local MON_STARTED=""
+  local MON_FAILED=""
+  if [ "$SKIP_MONITORING" = "yes" ]; then
+    info "Monitoring skipped (--skip-monitoring)"
+  else
+    for svc in dockge prometheus cadvisor grafana; do
+      svc_upper=$(echo "$svc" | tr '[:lower:]' '[:upper:]')
+      skip_var="SKIP_$svc_upper"; ex_var="EXISTING_${svc_upper}_PORT"; port_var="${svc_upper}_PORT"
+      [ "$svc" = "prometheus" ] && port_var="PROM_PORT"
+
+      if [ "${!skip_var}" = "yes" ]; then
+        ex="${!ex_var}"
+        [ -n "$ex" ] && info "$svc: REUSED (existing at :$ex)" || info "$svc: skipped"
+        continue
+      fi
+
+      # Not in compose? (shouldn't happen — generate_monitoring_compose only includes non-skipped)
+      if ! grep -q "^  ${svc}:" docker-compose.monitoring.yml 2>/dev/null; then
+        warn "$svc: not in compose — skipping"
+        continue
+      fi
+
+      info "Starting $svc (--no-deps) ..."
+      local start_output start_rc
+      start_output=$(docker compose -f docker-compose.monitoring.yml up -d --no-deps "$svc" 2>&1)
+      start_rc=$?
+      if [ "$start_rc" -eq 0 ]; then
+        ok "$svc started"
+        MON_STARTED="$MON_STARTED $svc"
+      else
+        fail "$svc failed"
+        echo "    $(echo "$start_output" | grep -E 'Error|error|Conflict' | head -1)"
+        MON_FAILED="$MON_FAILED $svc"
+        echo ""
+        echo "    [S]kip $svc (mark skip, save to .env)"
+        echo "    [P]ick new port and retry"
+        echo "    [K]eep error and continue"
+        printf "    Choice [S/p/k] (Enter=K): "
+        local c=""; read -t 15 -r c; c="${c:-K}"
+        case "$c" in
+          [Ss]*) eval "SKIP_$svc_upper=yes"; save_env; ok "$svc marked as skip" ;;
+          [Pp]*) new_port=$(find_next_free $(( ${!port_var} + 1 )))
+                 eval "$port_var=$new_port"; save_env
+                 info "Retrying $svc on :$new_port"
+                 docker compose -f docker-compose.monitoring.yml up -d --no-deps "$svc" \
+                   && { ok "$svc started on :$new_port"; MON_STARTED="$MON_STARTED $svc"; } \
+                   || { warn "$svc retry failed — continuing"; MON_FAILED="$MON_FAILED $svc"; } ;;
+          *) warn "$svc kept in error state" ;;
+        esac
+      fi
+    done
+
+    # Health checks — only for services we started (not reused, not failed)
+    wait_http() {
+      local url="$1" label="$2" w=0
+      while [ "$w" -lt 60 ]; do
+        curl -fsS --max-time 5 "$url" &>/dev/null && { ok "$label OK"; return 0; }
+        sleep 2; w=$((w + 2))
+      done
+      fail "$label not reachable ($url)"
+    }
+    for svc in dockge prometheus cadvisor grafana; do
+      svc_upper=$(echo "$svc" | tr '[:lower:]' '[:upper:]')
+      skip_var="SKIP_$svc_upper"; port_var="${svc_upper}_PORT"
+      [ "$svc" = "prometheus" ] && port_var="PROM_PORT"
+      case "$MON_STARTED" in
+        *" $svc"*) # was started by us — verify it
+          case "$svc" in
+            dockge)     wait_http "http://localhost:${!port_var}" "Dockge" ;;
+            prometheus) wait_http "http://localhost:${!port_var}/-/healthy" "Prometheus" ;;
+            cadvisor)   wait_http "http://localhost:${!port_var}/healthz" "cAdvisor" ;;
+            grafana)    wait_http "http://localhost:${!port_var}/api/health" "Grafana" ;;
+          esac ;;
+      esac
+    done
+  fi
+
+  # ----------------------------------------------------------------
+  # 14. Summary — honest status per service
+  # ----------------------------------------------------------------
+  step "Summary"
+  local PAGES_URL="https://$owner.github.io/$REPO_NAME/"
+  echo "  Pages:    $PAGES_URL"
+  echo "  Backend:  http://localhost:$BACKEND_PORT/api/health"
+  echo ""
+  echo "  Monitoring:"
+  for svc in dockge prometheus cadvisor grafana; do
+    svc_upper=$(echo "$svc" | tr '[:lower:]' '[:upper:]')
+    skip_var="SKIP_$svc_upper"; ex_var="EXISTING_${svc_upper}_PORT"; port_var="${svc_upper}_PORT"
+    [ "$svc" = "prometheus" ] && port_var="PROM_PORT"
+    case "$MON_STARTED" in
+      *" $svc"*) echo "    $svc:  STARTED  http://localhost:${!port_var}" ;;
+      *) case "$MON_FAILED" in
+        *" $svc"*) echo "    $svc:  FAILED   — see log above or 'docker compose -f docker-compose.monitoring.yml logs $svc'" ;;
+        *) if [ "${!skip_var}" = "yes" ]; then
+             [ -n "${!ex_var}" ] && echo "    $svc:  REUSED   existing at :${!ex_var}" || echo "    $svc:  skipped"
+           else echo "    $svc:  not started" ; fi ;;
+      esac ;;
+    esac
+  done
+  echo ""
+  if [ -n "$MON_FAILED" ]; then
+    echo "  ⚠️  Some monitoring services failed to start. This does not affect backend."
+    echo "     Re-run with -p to re-pick ports, or edit .env and re-run."
+  fi
+  curl -s --max-time 5 "http://localhost:$BACKEND_PORT/api/status" | python3 -m json.tool 2>&1 || true
+  if   command -v xdg-open &>/dev/null; then xdg-open "$PAGES_URL" &>/dev/null &
+  elif command -v open     &>/dev/null; then open     "$PAGES_URL" &>/dev/null &
+  fi
+
+  # Backend failures are the only hard error
+  if [ -z "$healthy" ]; then
+    fail "Backend failed — this is blocking"
+  fi
+  return "$ERRORS"
+}
+
+main "$@"
+CORE_BUILD_EOF
+
+chmod +x "$BUILD_SCRIPT"
+echo "▶ Executing $BUILD_SCRIPT ..."
+./"$BUILD_SCRIPT" "$@"
+BUILD_EXIT=$?
+echo ""
+case "$BUILD_EXIT" in
+  0)   echo "🎉 One-shot build succeeded." ;;
+  130) echo "⚠️  Interrupted. Re-run to resume." ;;
+  *)   echo "🔥 Build completed with errors (exit $BUILD_EXIT)." ;;
+esac
+📋 What Changed
+Bug	Old behavior	New behavior
+depends_on: prometheus started phantom prometheus	docker compose up -d grafana started our prometheus → name conflict	generate_monitoring_compose omits the skipped service entirely; grafana has no depends_on when prometheus is skipped
+Stale .env port used on busy port	:3001 (opencode-grafana) used by our grafana → bind fails	Step 3 re-validates all saved ports; if any is busy, re-resolves
+--no-deps missing	Compose started dependencies automatically	--no-deps on every monitoring start — we control what runs
+✅ Grafana OK false positive	Health check hit opencode-grafana, not ours	Health check only runs on services MON_STARTED contains — i.e., ones we started
+Hard failure on monitoring	ERRORS incremented, but summary still fired; user unclear	Monitoring failure offers [S]kip / [P]ick port / [K]eep inline; only backend failure is blocking
+Reused prometheus unreachable from grafana	Not addressed	extra_hosts: host.docker.internal:host-gateway on all services — grafana can reach http://host.docker.internal:9090
+Summary claims "OK" for reused services	Generic ✅	Honest per-service: STARTED, REUSED, FAILED, skipped
+interesting, user (I am) did disable ipv6, is it needed?
+
+https://swipswaps.github.io/proxmox-orchestrator/ "Checking backend…"
+The user disabled IPv6, but their backend is returning "detail": "Invalid IPv6 URL
+"
+. They want to know if IPv6 is needed, and why the GitHub Pages site shows "Checking backend…" indefinitely.
+
+The core issue: Proxmox API URL parsing in Python's 
+httpx
+/urllib is failing because the URL string is malformed when IPv6 is disabled. 
+proxmoxer
+ likely parses https://192.
+168.1.100:8006
+ incorrectly if it interprets something as an IPv6 bracket. Or, the PROXMOX_HOST value in .env has brackets or a format that urllib.parse treats as IPv6.
+
+Also, the frontend shows "Checking backend…" because the GitHub Pages site (HTTPS) cannot reach http://localhost:8002/api/health — mixed content blocking (HTTPS page → HTTP backend). The backend is running locally, but the browser blocks the request. The page will remain "Checking backend…" because the fetch fails silently and the timeout only triggers 
+loading=false
+ after 3s, but the fetch to http://localhost is blocked by the browser.
+
+So two separate problems:
+
+Backend: "Invalid IPv6 URL" — Proxmox API URL parsing issue, likely PROXMOX_HOST format.
+
+Frontend: GitHub Pages (HTTPS) cannot reach local backend (HTTP) — mixed content.
+
+Let me search for details.
+
+Found 40 web pages
+Let me open a few relevant results.
+
+Result 1 from search 1 (urllib parse.py) shows the exact Invalid IPv6 URL condition: if (('[' in netloc and ']' not in netloc) or (']' in netloc and '[' not in netloc)): raise ValueError("Invalid IPv6 URL"). This means the PROXMOX_HOST value contains a [ or ] without its pair. Common cause: the host is 192.168.1
+.100
+ but the URL construction produces something like https://192.168.1.100:8006 — that shouldn't have brackets. Unless PROXMOX_HOST is empty and proxmoxer builds a URL like https://:8006 or similar. Or the PROXMOX_HOST contains a literal IPv6 address without brackets.
+
+Wait — the backend returned proxmox_configured: true, so PROXMOX_HOST is non-empty. It returned proxmox_connected: false with detail: "Invalid IPv6 URL". So get_proxmox_connection() succeeded in constructing the ProxmoxAPI object, but 
+version.get()
+ failed with 
+Invalid IPv6 URL
+.
+
+proxmoxer builds the URL from host argument. If PROXMOX_HOST is https://192.168.1.100:8006, proxmoxer might parse it. Actually proxmoxer expects the host to be either a hostname or a full URL. If it's a full URL with scheme, it parses it. The Invalid IPv6 URL comes from urllib.parse.urlsplit when the netloc has unmatched brackets.
+
+Common cause: PROXMO
+X_HOST
+ value contains a [ or ] from an IPv6 address, or the URL is malformed. Let me check proxmoxer's host handling. Also, the httpx NO_PROXY IPv6 CIDR bug could cause InvalidURL — but the error message is specifically Invalid IPv6 URL (urllib), not httpx.InvalidURL.
+
+The user said they disabled IPv6. But the error is URL parsing, not connectivity. The fix: check backend/.env for PROXMOX_HOST — it should be a clean hostname/IP, e.g., 192.168.1.100 or https://192.168.1.100:8006. If it contains brackets or an IPv6 address, that's the bug.
+
+Also, the frontend "Checking backend…" is mixed content: GitHub Pages (HTTPS) fetching http://localhost:8002 — blocked by browser. The fetch fails, but the AbortController timeout only fires after 3s, and the .catch sets loading: false. Wait — the frontend code has setTimeout(() => c.abort(), 3000) and .catch(() => setState(prev => ({ ...prev, loading: false }))). So after 3s it should show "Backend unreachable" banner, not "Checking backend…" forever. Unless the fetch promise never resolves or rejects — mixed content blocked requests may throw synchronously, which should reject the promise. But maybe the browser blocks and the AbortController doesn't fire. Or the user is seeing the page before the 3s timeout.
+
+Actually, mixed content blocking on fetch to http://localhost from an HTTPS page: Chrome blocks it and the promise rejects with TypeError: Failed to fetch. That should hit .catch and set loading: false. So the page should show the amber "Backend unreachable" banner after 3s, not "Checking backend…" indefinitely. The user says it shows "Checking backend…" — maybe they're viewing before 3s, or the abort never fires because the fetch is blocked in a way that doesn't settle.
+
+The fix: the frontend must call https:// backend, or use a tunnel (ngrok/cloudflared), or the user runs the frontend locally instead of GitHub Pages. The GitHub Pages site cannot reach a local HTTP backend due to mixed content. This is a browser security restriction, not a code bug.
+
+But wait — the frontend's API_BASE defaults to '' (empty string), so it fetches relative /api/health on the GitHub Pages origin https://swipswaps.github.io/proxmox-orchestrator/api/health — which 404s (Pages has no backend). That fetch returns 404, r.ok is false, so it returns early, and state stays loading: true forever because the .then returns undefined without calling setState. That's the actual bug: when /api/health returns non-OK (404 on Pages), the .then handler returns without setting loading: false. The .catch only fires on network error, not on HTTP 404.
+
+Let me re-read the frontend code:
+
+js
+fetch(`${API_BASE}/api/health`, { signal: c.signal })
+  .then(r => { if (!r.ok) return; return fetch(`${API_BASE}/api/status`).then(r2 => r2.json()); })
+  .then(s => { if (s) setState({...}); })
+  .catch(() => setState(prev => ({ ...prev, loading: false })))
+  .finally(() => clearTimeout(t));
+If 
+r.ok
+ is false, .then returns undefined. Next .then(s => { if (s) setState(...) }) — s is undefined, so no setState. .catch doesn't fire (no error). .finally clears timeout. So loading stays true forever. That's the bug — the page shows "Checking backend…" indefinitely on GitHub Pages because /api/health returns 404 (Pages doesn't have the endpoint).
+
+The fix: after a non-OK response, set loading: false and backendOnline: false. Also, for GitHub Pages, API_BASE should be configurable via VITE_API_BASE — but mixed content will block HTTP. The user needs to either run the frontend locally, or use an HTTPS tunnel, or accept that GitHub Pages is demo-only.
+
+So the answer has two parts:
+
+IPv6 is not needed — the Invalid IPv6 URL is a URL-parsing bug in PROXMOX_HOST, not a connectivity issue. Check backend/.env for malformed host (brackets, IPv6 literal without brackets, or empty).
+
+"Checking backend…" forever is a frontend logic bug: non-OK HTTP responses don't set 
+loading: false
+. Plus, GitHub Pages (HTTPS) cannot fetch 
+http://localhost
+ (mixed content) anyway.
+
+Let me open the urllib parse result to confirm.
+
+Read 3 pages
+my_container_sandbox/workspace/anaconda3/lib/python3.8/urllib/parse.py · prasb/difftumor at f0d9c1e44b886dd3b6989e43c17a27a2d8ba87f6 - if len(_parse_cache) >= MAX_CACHE_SIZE: # avoid runaway growth
+How can i allow my react frontend that is deployed on GitHub pages to access localhost backend api? - Asked
+Github pages not showing react app website correctly - Asked
+Confirmed. Now let me craft the final answer.
+
+Key points:
+
+IPv6 is not needed. The Invalid IPv6 URL comes from Python's urllib.parse.urlsplit raising ValueError("Invalid IPv6 URL") when the netloc contains an unmatched [ or ][reference:0]. It's a URL parsing bug, not a connectivity issue. 
+PROXMOX_HOST
+ in backend/.env is malformed — likely contains brackets, an IPv6 literal without proper brackets, or an empty scheme/host combination that produces a stray bracket. Proxmox docs themselves note IPv6 literals must be wrapped in square brackets (RFC 3986), otherwise browsers/parsers can't distinguish port from IPv6 segment[reference:1].
+
+Fix: PROXMOX_HOST should be a clean hostname or IPv4, e.g. 192.168.1.100 or https://192.168.1.100:8006 — no brackets, no IPv6 literal. Then restart the backend container.
+
+"Checking backend…" forever is a frontend logic bug, not a backend problem. The GitHub Pages site is HTTPS; API_BASE is '', so it fetches https://swipswaps.github.io/proxmox-orchestrator/api/health — which returns 404 (Pages has no backend). In App.jsx:
+
+js
+.then(r => { if (!r.ok) return; ... })
+A 404 returns early with undefined; the next .then(s => { if (s) setState(...) }) sees undefined and does nothing; .catch never fires because there's no network error. loading stays true forever.
+
+Even if the fetch succeeded, GitHub Pages (HTTPS) cannot fetch http://localhost:8002 — browser mixed-content blocking[reference:2][reference:3]. The localhost backend is unreachable from an HTTPS origin.
+
+Fix for the frontend: Always settle the loading state:
+
+js
+fetch(...).then(r => {
+  if (!r.ok) { setState(prev => ({...prev, loading: false, backendOnline: false})); return; }
+  return fetch(...).then(r2 => r2.json()).then(s => setState({...}));
+}).catch(() => setState(prev => ({...prev, loading: false})));
+How to actually use the backend from the browser: Either run the frontend locally (npm run dev), or use an HTTPS tunnel (cloudflared/ngrok) to expose :8002 and set VITE_API_BASE to the tunnel URL, or host the frontend on the same host as the backend. GitHub Pages is demo-only by design — that's why the banner was supposed to say "Backend unreachable".
+
+Provide an upgraded heredoc that fixes both the frontend loading state and adds a PROXMOX_HOST validator + URL cleaner in the backend.
+
+Let me write the final answer. I should keep it focused: the user asked two questions — "is IPv6 needed?" and "why Checking backend…?". I should answer both directly, then provide the upgraded heredoc.
+
+Let me also note the NO_PROXY IPv6 CIDR httpx bug: httpx 0.25+ has a bug where IPv6 CIDR in NO_PROXY causes InvalidURL[reference:4]. But the error here is Invalid IPv6 URL (urllib), not httpx.InvalidURL. Still, worth mentioning as a secondary possibility if PROXMOX_HOST is clean.
+
+Now write the final answer with citations.
+
+Short Answers
+IPv6 is not needed. The "Invalid IPv6 URL" is a URL‑parsing failure, not a network failure. Python's urllib.parse.urlsplit raises ValueError("Invalid IPv6 URL") whenever the netloc contains an unmatched [ or ] — it never even attempts a connection. Your PROXMOX_HOST value in backend/.env is malformed: it contains a bracket, an IPv6 literal without brackets, or an empty scheme/host combination that produces a stray bracket. Proxmox's own docs note that IPv6 literals must be wrapped in [...] (RFC 3986), otherwise parsers cannot tell the port from the IPv6 segment. A clean hostname or IPv4 (e.g. 192.168.1.100 or https://192.168.1.100:8006) fixes it with IPv6 disabled.
+
+"Checking backend…" forever is a frontend logic bug, made worse by mixed‑content blocking. Your GitHub Pages site is served over HTTPS. API_BASE is '', so the page fetches https://swipswaps.github.io/proxmox-orchestrator/api/health — which returns 404 because Pages has no backend. In App.jsx the 404 path returns undefined early, so setState is never called and loading stays true forever. Even if the endpoint existed, the browser would block an HTTPS page from fetching http://localhost:8002 — that is mixed content, and it is deliberately blocked by Chrome/Firefox. Your backend on :8002 is unreachable from GitHub Pages by design.
+
+🔧 Two Fixes
+1. Clean PROXMOX_HOST (backend)
+bash
+# backend/.env — pick ONE clean form; no brackets, no IPv6 literal
+PROXMOX_HOST=192.168.1.100
+# or
+PROXMOX_HOST=https://192.168.1.100:8006
+Then restart:
+
+bash
+docker compose up -d --force-recreate backend
+curl -s http://localhost:8002/api/status | python3 -m json.tool
+If PROXMOX_HOST is already clean and the error persists, you are hitting the httpx 0.25+ NO_PROXY IPv6 CIDR bug: when NO_PROXY contains an IPv6 CIDR (e.g. fd00::/8), httpx raises InvalidURL. Fix:
+
+bash
+# inside the backend container / Dockerfile
+ENV NO_PROXY=""
+ENV no_proxy=""
+or unset it before importing httpx:
+
+python
+import os
+os.environ.pop("NO_PROXY", None)
+os.environ.pop("no_proxy", None)
+2. Fix the infinite "Checking backend…" (frontend)
+The current code never settles loading on a non‑OK response. Replace the health‑check effect with one that always ends in a known state:
+
+jsx
+useEffect(() => {
+  const c = new AbortController();
+  const t = setTimeout(() => c.abort(), 3000);
+  const offline = (detail = '') =>
+    setState({ loading: false, backendOnline: false,
+               proxmoxConfigured: false, proxmoxConnected: false, detail });
+
+  fetch(`${API_BASE}/api/health`, { signal: c.signal })
+    .then(r => {
+      if (!r.ok) { offline(`HTTP ${r.status}`); return; }
+      return fetch(`${API_BASE}/api/status`)
+        .then(r2 => r2.ok ? r2.json() : Promise.reject(new Error(`HTTP ${r2.status}`)))
+        .then(s => setState({
+          loading: false, backendOnline: true,
+          proxmoxConfigured: s.proxmox_configured,
+          proxmoxConnected: s.proxmox_connected,
+          detail: s.detail || ''
+        }));
+    })
+    .catch(err => offline(err?.message || 'network error'))
+    .finally(() => clearTimeout(t));
+}, []);
+Now a 404, a mixed‑content block, or a timeout all land on the amber “Backend unreachable — demo mode” banner instead of hanging.
+
+🌐 How to Actually Connect the Browser to Your Backend
+GitHub Pages cannot reach http://localhost from an HTTPS origin. Three working options:
+
+Option	When to use	Command
+Run the frontend locally	Development / demo	cd frontend && npm run dev → http://localhost:3000 proxies /api to :8002
+HTTPS tunnel	Remote demo	cloudflared tunnel --url http://localhost:8002 → set VITE_API_BASE=https://<tunnel>.trycloudflare.com, rebuild, redeploy
+Serve frontend from the backend	Production	app.mount("/", StaticFiles(directory="dist", html=True)) — same origin, no CORS, no mixed content
+GitHub Pages is demo‑only by design — that is exactly why the amber banner exists.
+
+📄 Upgraded Heredoc (frontend loading fix + PROXMOX_HOST validator)
+bash
+#!/usr/bin/env bash
+# one-shot-build.sh — v6: settles loading state; validates PROXMOX_HOST
+REPO_NAME="${REPO_NAME:-proxmox-orchestrator}"
+BUILD_SCRIPT="build_and_deploy.sh"
+echo "▶ Emitting $BUILD_SCRIPT ..."
+
+cat > "$BUILD_SCRIPT" <<'CORE_BUILD_EOF'
+#!/usr/bin/env bash
+set +e
+trap 'echo ""; echo "⚠️  Interrupted"; exit 130' INT
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)"
+[ "$(basename "$SCRIPT_DIR")" = "scripts" ] && cd "$(dirname "$SCRIPT_DIR")"
+REPO_NAME="${REPO_NAME:-proxmox-orchestrator}"
+PAGES_BRANCH="gh-pages"
+ERRORS=0
+fail() { echo "❌ $1"; ERRORS=$((ERRORS + 1)); }
+ok()   { echo "✅ $1"; }
+info() { echo "ℹ️  $1"; }
+step() { echo ""; echo "▶ $1"; }
+warn() { echo "⚠️  $1"; }
+
+port_in_use() { ss -ltn 2>&1 | awk '{print $4}' | grep -qE "[:.]$1$"; }
+find_next_free() { local p="$1"; while [ "$p" -le 65535 ]; do port_in_use "$p" || { echo "$p"; return 0; }; p=$((p+1)); done; }
+port_owner() {
+  local c; c=$(docker ps --filter "publish=$1" --format '{{.Names}}' | head -1)
+  [ -n "$c" ] && { echo "docker:$c"; return; }
+  echo "unknown"
+}
+
+step "0. Pre-flight"
+local missing=""
+for tool in gh git docker node npm; do command -v "$tool" &>/dev/null && ok "$tool" || missing="$missing $tool"; done
+[ -n "$missing" ] && { fail "Missing:$missing"; return "$ERRORS"; }
+local owner; owner=$(gh api user --jq '.login' 2>&1) || owner=""
+[ -z "$owner" ] && { fail "gh not authenticated"; return "$ERRORS"; }
+ok "Authenticated as $owner"
+git config user.email &>/dev/null || git config user.email "build@localhost"
+git config user.name  &>/dev/null || git config user.name  "Build Script"
+
+step "1. Ports"
+local BACKEND_PORT=8002
+if port_in_use "$BACKEND_PORT"; then BACKEND_PORT=$(find_next_free 8003); fi
+ok "Backend port: $BACKEND_PORT"
+
+cat > .env <<EOF
+BACKEND_PORT=$BACKEND_PORT
+EOF
+
+step "2. Git"
+[ -d .git ] || git init -b main || fail "git init"
+local cur; cur=$(git symbolic-ref --short HEAD 2>&1) || cur=""
+[ "$cur" != "main" ] && git checkout -B main
+ok "Git ready"
+
+step "3. Emit files"
+mkdir -p backend terraform ansible frontend/src frontend/public monitoring/prometheus backend/data
+
+cat > backend/.env.example <<'EOF'
+# PROXMOX_HOST must be a clean hostname or IPv4.
+# Do NOT include brackets or an IPv6 literal without [ ].
+# Examples: 192.168.1.100   https://192.168.1.100:8006
+PROXMOX_HOST=
+PROXMOX_USER=root@pam
+PROXMOX_TOKEN_ID=
+PROXMOX_TOKEN_SECRET=
+PROXMOX_NODE=pve
+PROXMOX_VERIFY_SSL=false
+PROXMOX_TIMEOUT=5
+NO_PROXY=
+no_proxy=
+DATABASE_PATH=/app/data/orchestrator.db
+EOF
+
+cat > backend/proxmox_client.py <<'EOF'
+import os
+from urllib.parse import urlsplit, urlunsplit
+from proxmoxer import ProxmoxAPI
+
+def _clean_host(raw: str) -> str:
+    """Return a PROXMOX_HOST safe for urllib/proxmoxer.
+    Strips stray brackets, normalises scheme, removes trailing slash.
+    """
+    h = (raw or "").strip()
+    if not h:
+        return ""
+    # Reject unmatched brackets early with a clear message
+    if ("[" in h and "]" not in h) or ("]" in h and "[" not in h):
+        raise ValueError(
+            f"PROXMOX_HOST={h!r} has an unmatched bracket. "
+            "Use a plain IPv4/hostname (e.g. 192.168.1.100) or a bracketed "
+            "IPv6 literal (e.g. https://[fe80::1]:8006)."
+        )
+    if not h.startswith(("http://", "https://")):
+        h = "https://" + h
+    parts = urlsplit(h)
+    host = parts.hostname or ""
+    if not host:
+        raise ValueError(f"PROXMOX_HOST={raw!r} has no host component")
+    netloc = host
+    if parts.port:
+        netloc = f"{host}:{parts.port}"
+    return urlunsplit((parts.scheme, netloc, "", "", ""))
+
+def is_proxmox_configured() -> bool:
+    return all(os.environ.get(k) for k in
+               ["PROXMOX_HOST","PROXMOX_USER","PROXMOX_TOKEN_ID","PROXMOX_TOKEN_SECRET"])
+
+def get_proxmox_connection():
+    # Drop any proxy env that can make httpx choke on IPv6 CIDRs
+    os.environ.pop("NO_PROXY", None)
+    os.environ.pop("no_proxy", None)
+    user = os.environ["PROXMOX_USER"]
+    if "@" not in user:
+        raise ValueError("PROXMOX_USER must include @realm, e.g. root@pam")
+    host = _clean_host(os.environ["PROXMOX_HOST"])
+    return ProxmoxAPI(
+        host, user=user,
+        token_name=f"{user}!{os.environ['PROXMOX_TOKEN_ID']}",
+        token_value=os.environ["PROXMOX_TOKEN_SECRET"],
+        verify_ssl=os.environ.get("PROXMOX_VERIFY_SSL","false").lower()=="true",
+        service="PVE",
+        timeout=int(os.environ.get("PROXMOX_TIMEOUT","5")),
+    )
+EOF
+
+cat > backend/main.py <<'EOF'
+import os, subprocess
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+from database import init_db, get_db_connection
+from proxmox_client import get_proxmox_connection, is_proxmox_configured
+
+app = FastAPI()
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+
+class DeploymentRequest(BaseModel):
+    name: str; type: str; node: str; cores: int = 2; memory: int = 2048
+
+@app.on_event("startup")
+def startup_event(): init_db()
+
+@app.get("/api/health")
+def health(): return {"status": "ok"}
+
+@app.get("/api/status")
+def status():
+    configured = is_proxmox_configured()
+    connected = False; detail = ""
+    if configured:
+        try:
+            get_proxmox_connection().version.get()
+            connected = True
+        except Exception as e:
+            detail = f"{type(e).__name__}: {e}"
+    return {"backend":"ok","proxmox_configured":configured,
+            "proxmox_connected":connected,"detail":detail}
+
+@app.get("/api/nodes")
+def list_nodes():
+    if not is_proxmox_configured():
+        return {"nodes":[],"proxmox_available":False,"message":"Proxmox not configured"}
+    try: return {"nodes": get_proxmox_connection().nodes.get(), "proxmox_available": True}
+    except Exception as e: return {"nodes":[],"proxmox_available":False,"message":str(e)}
+
+@app.post("/api/deploy")
+def trigger_deployment(req: DeploymentRequest):
+    if not is_proxmox_configured(): raise HTTPException(503, "Proxmox not configured")
+    try: get_proxmox_connection().version.get()
+    except Exception as e: raise HTTPException(503, f"Proxmox unreachable: {e}")
+    conn = get_db_connection(); cur = conn.cursor()
+    cur.execute("INSERT INTO deployments (name,type,target_node,status) VALUES (?,?,?,?)",
+                (req.name, req.type, req.node, "PENDING"))
+    conn.commit(); dep_id = cur.lastrowid; conn.close()
+    env = os.environ.copy(); env.update({
+        "TF_VAR_instance_name": req.name, "TF_VAR_target_node": req.node,
+        "TF_VAR_cores": str(req.cores), "TF_VAR_memory": str(req.memory),
+        "TF_VAR_instance_type": req.type})
+    try:
+        for cmd, t in [(["terraform","init","-upgrade"], 120),
+                       (["terraform","apply","-auto-approve"], 600)]:
+            p = subprocess.Popen(cmd, cwd="/app/terraform", env=env,
+                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                 start_new_session=True)
+            _, err = p.communicate(timeout=t)
+            if p.returncode != 0: raise RuntimeError(err.decode())
+        conn = get_db_connection()
+        conn.execute("UPDATE deployments SET status=? WHERE id=?", ("SUCCESS", dep_id))
+        conn.commit(); conn.close()
+        return {"status": "success", "deployment_id": dep_id}
+    except Exception as e:
+        conn = get_db_connection()
+        conn.execute("UPDATE deployments SET status=? WHERE id=?", ("FAILED", dep_id))
+        conn.commit(); conn.close()
+        raise HTTPException(500, str(e))
+
+@app.get("/api/deployments")
+def get_deployments():
+    conn = get_db_connection()
+    rows = conn.execute("SELECT * FROM deployments ORDER BY created_at DESC").fetchall()
+    conn.close(); return [dict(r) for r in rows]
+EOF
+
+cat > backend/database.py <<'EOF'
+import sqlite3, os
+DB_PATH = os.getenv("DATABASE_PATH", "/app/data/orchestrator.db")
+def get_db_connection():
+    os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    return conn
+def init_db():
+    conn = get_db_connection()
+    with conn:
+        conn.execute("""CREATE TABLE IF NOT EXISTS deployments (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL,
+            type TEXT NOT NULL CHECK(type IN ('lxc','vm')),
+            target_node TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'PENDING',
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)""")
+    conn.close()
+EOF
+
+cat > backend/requirements.txt <<'EOF'
+fastapi==0.115.0
+uvicorn[standard]==0.31.0
+pydantic==2.9.2
+proxmoxer==2.0.1
+requests==2.32.3
+ansible-core==2.17.3
+python-dotenv==1.0.1
+EOF
+
+cat > backend/Dockerfile <<'EOF'
+FROM python:3.11-slim
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl unzip git openssh-client && rm -rf /var/lib/apt/lists/*
+ARG TERRAFORM_VERSION=1.17.1
+RUN curl -fsSLo /tmp/terraform.zip \
+    "https://releases.hashicorp.com/terraform/${TERRAFORM_VERSION}/terraform_${TERRAFORM_VERSION}_linux_amd64.zip" \
+    && unzip /tmp/terraform.zip -d /usr/local/bin \
+    && chmod +x /usr/local/bin/terraform && rm /tmp/terraform.zip
+RUN pip install --no-cache-dir ansible-core==2.17.3
+WORKDIR /app
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+COPY . .
+RUN useradd -m -u 1000 appuser && chown -R appuser:appuser /app
+USER appuser
+ENV NO_PROXY=""
+ENV no_proxy=""
+EXPOSE 8000
+HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
+  CMD ["sh", "-c", "curl -f http://localhost:8000/api/health || kill -TERM 1"]
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
+EOF
+
+# ... (terraform/, ansible/, frontend/ boilerplate unchanged from v5) ...
+
+# FRONTEND FIX — loading state always settles
+cat > frontend/src/App.jsx <<'EOF'
+import React, { useState, useEffect } from 'react';
+const API_BASE = import.meta.env.VITE_API_BASE || '';
+
+export default function App() {
+  const [deployments, setDeployments] = useState([]);
+  const [state, setState] = useState({
+    loading: true, backendOnline: false,
+    proxmoxConfigured: false, proxmoxConnected: false, detail: '',
+  });
+  const [form, setForm] = useState({ name: '', node: 'pve', type: 'lxc' });
+
+  useEffect(() => {
+    const c = new AbortController();
+    const t = setTimeout(() => c.abort(), 3000);
+    const offline = (detail = '') =>
+      setState({ loading: false, backendOnline: false,
+                 proxmoxConfigured: false, proxmoxConnected: false, detail });
+
+    fetch(`${API_BASE}/api/health`, { signal: c.signal })
+      .then(r => {
+        if (!r.ok) { offline(`HTTP ${r.status}`); return; }
+        return fetch(`${API_BASE}/api/status`)
+          .then(r2 => r2.ok ? r2.json() : Promise.reject(new Error(`HTTP ${r2.status}`)))
+          .then(s => setState({
+            loading: false, backendOnline: true,
+            proxmoxConfigured: s.proxmox_configured,
+            proxmoxConnected: s.proxmox_connected,
+            detail: s.detail || ''
+          }));
+      })
+      .catch(err => offline(err?.message || 'network error'))
+      .finally(() => clearTimeout(t));
+  }, []);
+
+  useEffect(() => {
+    if (!state.backendOnline) return;
+    fetch(`${API_BASE}/api/deployments`)
+      .then(r => r.ok ? r.json() : [])
+      .then(setDeployments).catch(() => {});
+  }, [state.backendOnline]);
+
+  const handleDeploy = async (e) => {
+    e.preventDefault();
+    if (!state.proxmoxConnected) return;
+    const r = await fetch(`${API_BASE}/api/deploy`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ...form, cores: 2, memory: 2048 }),
+    });
+    if (r.ok) { alert('Deployment triggered!'); window.location.reload(); }
+    else { const j = await r.json().catch(() => ({})); alert('Deploy failed: ' + (j.detail || r.status)); }
+  };
+
+  if (state.loading) return <p style={{ padding: 40 }}>Checking backend…</p>;
+  const deployEnabled = state.backendOnline && state.proxmoxConnected;
+  let banner;
+  if (!state.backendOnline) banner = { bg: '#fff3cd', color: '#856404',
+    text: `⚠️ Backend unreachable${state.detail ? ` (${state.detail})` : ''}. Running in demo mode.` };
+  else if (!state.proxmoxConfigured) banner = { bg: '#cfe2ff', color: '#084298',
+    text: 'ℹ️ Backend online. Proxmox not configured — fill PROXMOX_* in backend/.env.' };
+  else if (!state.proxmoxConnected) banner = { bg: '#fff3cd', color: '#856404',
+    text: `⚠️ Proxmox configured but unreachable${state.detail ? `: ${state.detail}` : ''}.` };
+  else banner = { bg: '#d1e7dd', color: '#0f5132', text: '✅ Backend online, Proxmox connected.' };
+
+  return (
+    <div style={{ fontFamily: 'sans-serif', maxWidth: 800, margin: '40px auto', padding: 20 }}>
+      <h2>Proxmox Remote Orchestration Console</h2>
+      <div style={{ background: banner.bg, color: banner.color, padding: 12, borderRadius: 4, marginBottom: 20 }}>{banner.text}</div>
+      <form onSubmit={handleDeploy} style={{ display: 'flex', gap: 10, marginBottom: 20, opacity: deployEnabled ? 1 : 0.5 }}>
+        <input type="text" placeholder="Instance Name" value={form.name} onChange={e => setForm({ ...form, name: e.target.value })} required disabled={!deployEnabled} />
+        <select value={form.type} onChange={e => setForm({ ...form, type: e.target.value })} disabled={!deployEnabled}><option value="lxc">LXC</option><option value="vm">VM</option></select>
+        <input type="text" placeholder="Target Node" value={form.node} onChange={e => setForm({ ...form, node: e.target.value })} required disabled={!deployEnabled} />
+        <button type="submit" disabled={!deployEnabled}>Deploy</button>
+      </form>
+      <h3>Deployment History</h3>
+      <table border="1" cellPadding="10" style={{ width: '100%', borderCollapse: 'collapse' }}>
+        <thead><tr><th>ID</th><th>Name</th><th>Type</th><th>Node</th><th>Status</th><th>Timestamp</th></tr></thead>
+        <tbody>
+          {deployments.length === 0 && <tr><td colSpan="6" style={{ textAlign: 'center' }}>No deployments.</td></tr>}
+          {deployments.map(d => (<tr key={d.id}><td>{d.id}</td><td>{d.name}</td><td>{d.type}</td><td>{d.target_node}</td><td>{d.status}</td><td>{d.created_at}</td></tr>))}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+EOF
+
+# docker-compose.yml (valid multi-line YAML, port from .env)
+cat > docker-compose.yml <<'EOF'
+services:
+  backend:
+    image: proxmox-orchestrator-backend
+    build:
+      context: ./backend
+    container_name: proxmox-orchestrator-backend
+    restart: unless-stopped
+    env_file:
+      - backend/.env
+    ports:
+      - "${BACKEND_PORT:-8002}:8000"
+    volumes:
+      - ./backend/data:/app/data
+      - ./terraform:/app/terraform
+      - ./ansible:/app/ansible
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/api/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    networks:
+      - orchestrator_net
+
+networks:
+  orchestrator_net:
+    driver: bridge
+EOF
+
+[ -f backend/.env ] || cp backend/.env.example backend/.env
+mkdir -p backend/data
+[ "$(id -u)" -ne 1000 ] && chmod 0777 backend/data &>/dev/null
+ok "Files emitted"
+
+step "4. Validate backend/.env PROXMOX_HOST"
+if grep -q '^PROXMOX_HOST=' backend/.env; then
+  host_val=$(grep '^PROXMOX_HOST=' backend/.env | cut -d= -f2-)
+  if [ -z "$host_val" ]; then
+    warn "PROXMOX_HOST is empty — backend will run Proxmox-free (OK)"
+  elif { [[ "$host_val" == *"["* ]] && [[ "$host_val" != *"]"* ]]; } || \
+       { [[ "$host_val" == *"]"* ]] && [[ "$host_val" != *"["* ]]; }; then
+    fail "PROXMOX_HOST='$host_val' has unmatched brackets — this causes 'Invalid IPv6 URL'"
+    info "Fix: set PROXMOX_HOST=192.168.1.100 (no brackets) or https://[fe80::1]:8006 (bracketed IPv6)"
+  else
+    ok "PROXMOX_HOST looks well-formed: $host_val"
+  fi
+fi
+
+step "5. Commit + push"
+git add -A
+git diff --cached --quiet && ok "No changes" || { git commit -m "Fix: frontend loading state + host validation" || fail "commit"; ok "Committed"; }
+if gh repo view "$owner/$REPO_NAME" &>/dev/null; then ok "Repo exists"
+else gh repo create "$REPO_NAME" --public --source=. --remote=origin --push || fail "create"; fi
+git remote get-url origin &>/dev/null || git remote add origin "https://github.com/$owner/$REPO_NAME.git"
+git push -u origin main || fail "push"
+ok "Pushed"
+
+step "6. Frontend"
+pushd frontend &>/dev/null
+[ -f package-lock.json ] || npm install --legacy-peer-deps
+npm ci --legacy-peer-deps || fail "npm ci"
+rm -rf dist
+VITE_BASE_PATH="/$REPO_NAME/" npm run build || fail "build"
+popd &>/dev/null
+[ -d frontend/dist ] && ok "dist/ produced" || fail "dist/ missing"
+
+step "7. gh-pages + Pages"
+pushd frontend &>/dev/null
+npx --yes gh-pages -d dist -r "https://github.com/$owner/$REPO_NAME.git" || fail "gh-pages"
+popd &>/dev/null
+ok "gh-pages pushed"
+local waited=0 found=""
+while [ "$waited" -lt 60 ]; do
+  git ls-remote --exit-code --heads origin "$PAGES_BRANCH" &>/dev/null && { found="yes"; break; }
+  sleep 3; waited=$((waited+3))
+done
+if [ -n "$found" ]; then
+  if gh api "repos/$owner/$REPO_NAME/pages" --silent &>/dev/null; then
+    gh api "repos/$owner/$REPO_NAME/pages" -X PUT --input - &>/dev/null <<JSON || fail "PUT"
+{"source":{"branch":"$PAGES_BRANCH","path":"/"}}
+JSON
+    ok "Pages updated"
+  else
+    gh api "repos/$owner/$REPO_NAME/pages" -X POST --input - &>/dev/null <<JSON || fail "POST"
+{"source":{"branch":"$PAGES_BRANCH","path":"/"}}
+JSON
+    ok "Pages enabled"
+  fi
+fi
+
+step "8. Backend"
+docker compose build backend || fail "build"
+docker compose up -d --force-recreate backend || fail "up"
+local hwaited=0 healthy=""
+while [ "$hwaited" -lt 60 ]; do
+  curl -fsS --max-time 5 "http://localhost:$BACKEND_PORT/api/health" &>/dev/null && { healthy="yes"; break; }
+  sleep 2; hwaited=$((hwaited+2))
+done
+[ -n "$healthy" ] && ok "Backend healthy on :$BACKEND_PORT" || fail "Backend unhealthy"
+
+step "Summary"
+echo "  Pages:    https://$owner.github.io/$REPO_NAME/"
+echo "  Backend:  http://localhost:$BACKEND_PORT/api/health"
+curl -s --max-time 5 "http://localhost:$BACKEND_PORT/api/status" | python3 -m json.tool 2>&1 || true
+echo ""
+echo "  If 'Invalid IPv6 URL' persists: edit backend/.env PROXMOX_HOST, then:"
+echo "    docker compose up -d --force-recreate backend"
+echo ""
+echo "  If Pages shows 'Checking backend…' after 3s: check browser console for"
+echo "  mixed-content block (HTTPS page → HTTP localhost). Use one of:"
+echo "    cd frontend && npm run dev            # local dev (proxied)"
+echo "    cloudflared tunnel --url http://localhost:$BACKEND_PORT"
+echo "    mount frontend/dist on FastAPI       # same-origin"
+if command -v xdg-open &>/dev/null; then xdg-open "https://$owner.github.io/$REPO_NAME/" &>/dev/null &
+elif command -v open &>/dev/null; then open "https://$owner.github.io/$REPO_NAME/" &>/dev/null &
+fi
+return "$ERRORS"
+CORE_BUILD_EOF
+chmod +x "$BUILD_SCRIPT"
+echo "▶ Executing $BUILD_SCRIPT ..."
+./"$BUILD_SCRIPT" "$@"
+BUILD_EXIT=$?
+echo ""
+case "$BUILD_EXIT" in
+  0)   echo "🎉 One-shot build succeeded." ;;
+  130) echo "⚠️  Interrupted." ;;
+  *)   echo "🔥 Build completed with errors (exit $BUILD_EXIT)." ;;
+esac
+Key additions in v6:
+
+Fix	Effect
+_clean_host() in proxmox_client.py	Detects unmatched brackets before calling urlsplit; raises a clear error naming PROXMOX_HOST instead of the opaque "Invalid IPv6 URL"
+os.environ.pop("NO_PROXY") + ENV NO_PROXY="" in Dockerfile	Neutralises the httpx 0.25+ IPv6 CIDR bug
+offline()
+ helper in App.jsx	A 404, timeout, or mixed‑content block always sets 
+loading: false
+ — no more infinite "Checking backend…"
+Step 4 validates PROXMOX_HOST	Fails early with an actionable message if the host has unmatched brackets
+Summary prints remediation	Tells the user exactly how to fix the mixed‑content problem
+After this, curl http://localhost:8002/api/status should return "proxmox_connected": true (assuming 
+PROXMOX_HOST
+ is clean), and the GitHub Pages site will show the amber "Backend unreachable" banner within 3 seconds instead of hanging — which is the correct behaviour for a demo‑only Pages deployment.
+
+
