@@ -2,7 +2,6 @@ import sqlite3, os
 DB_PATH = os.getenv("DATABASE_PATH", "/app/data/orchestrator.db")
 def get_db_connection():
     os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
-    # check_same_thread=False is required for FastAPI's threadpool
     conn = sqlite3.connect(DB_PATH, check_same_thread=False)
     conn.row_factory = sqlite3.Row
     return conn

@@ -12,4 +12,6 @@ dist/
 *.tfvars
 *.retry
 .env
+.env.tmp
+*.bak
 .DS_Store
