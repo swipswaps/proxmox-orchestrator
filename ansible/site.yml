@@ -6,9 +6,7 @@
     - firewalld:
         zone: drop
         rich_rule: 'rule family="ipv4" source address="192.168.0.0/16" service name="ssh" accept'
-        permanent: yes
-        immediate: yes
-        state: enabled
+        permanent: yes; immediate: yes; state: enabled
     - lineinfile:
         path: /etc/ssh/sshd_config
         regexp: '^#?PermitRootLogin'

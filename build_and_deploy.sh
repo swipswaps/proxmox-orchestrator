@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# build_and_deploy.sh — idempotent, pre-scan, no duplicate instances
+# build_and_deploy.sh — idempotent, orphan-aware, name-conflict-aware
 set +e
 trap 'echo ""; echo "⚠️  Interrupted"; exit 130' INT
 
@@ -16,10 +16,10 @@ ERRORS=0
 
 for arg in "$@"; do
   case "$arg" in
-    --yes|-y)              NON_INTERACTIVE="yes" ;;
-    --ports|-p)            FORCE_PORTS="yes" ;;
-    --free|-f)             AUTO_FREE="yes" ;;
-    --skip-monitoring|-m)  SKIP_MONITORING="yes" ;;
+    --yes|-y)             NON_INTERACTIVE="yes" ;;
+    --ports|-p)           FORCE_PORTS="yes" ;;
+    --free|-f)            AUTO_FREE="yes" ;;
+    --skip-monitoring|-m) SKIP_MONITORING="yes" ;;
   esac
 done
 
@@ -29,7 +29,7 @@ info() { echo "ℹ️  $1"; }
 step() { echo ""; echo "▶ $1"; }
 
 # ================================================================
-# Detection
+# Detection primitives
 # ================================================================
 port_in_use() {
   local p="$1"
@@ -56,13 +56,30 @@ port_owner() {
   fi
 }
 
+# Find any container (running or stopped) with image matching the service name.
+# Excludes our own project's containers.
 detect_service_container() {
   local service="$1"
-  docker ps --format '{{.Names}}|{{.Image}}|{{.Ports}}' 2>&1 | \
+  docker ps -a --format '{{.Names}}|{{.Image}}|{{.Ports}}|{{.State}}' 2>&1 | \
     awk -F'|' -v svc="$service" '
       tolower($2) ~ tolower(svc) && tolower($1) !~ /proxmox-orchestrator/ {
         print
-      }'
+      }' | head -n1
+}
+
+# NEW: check if a container NAME (regardless of state) is taken
+detect_name_conflict() {
+  local svc="$1"  # "dockge"
+  docker ps -a --filter "name=^${svc}$" --format '{{.Names}}' | grep -qx "$svc"
+}
+
+# NEW: given a conflicting name, classify it
+inspect_name_conflict() {
+  local svc="$1"
+  local img state
+  img=$(docker inspect --format '{{.Config.Image}}' "$svc" 2>&1)
+  state=$(docker inspect --format '{{.State.Status}}' "$svc" 2>&1)
+  echo "$img|$state"
 }
 
 extract_host_port() {
@@ -79,173 +96,156 @@ find_next_free() {
 }
 
 # ================================================================
-# Save incremental state so Ctrl+C doesn't lose progress
+# Orphan handler — interactive, shows commands, offers actions
 # ================================================================
-save_env_partial() {
-  cat > .env.tmp <<EOF
-# Partial state — will be renamed to .env when complete
-BACKEND_PORT=$BACKEND_PORT
-DOCKGE_PORT=$DOCKGE_PORT
-PROMETHEUS_PORT=$PROM_PORT
-CADVISOR_PORT=$CADVISOR_PORT
-GRAFANA_PORT=$GRAFANA_PORT
-SKIP_DOCKGE=$SKIP_DOCKGE
-SKIP_PROMETHEUS=$SKIP_PROMETHEUS
-SKIP_CADVISOR=$SKIP_CADVISOR
-SKIP_GRAFANA=$SKIP_GRAFANA
-EXISTING_DOCKGE_PORT=$EXISTING_DOCKGE_PORT
-EXISTING_PROMETHEUS_PORT=$EXISTING_PROMETHEUS_PORT
-EXISTING_CADVISOR_PORT=$EXISTING_CADVISOR_PORT
-EXISTING_GRAFANA_PORT=$EXISTING_GRAFANA_PORT
-EOF
-}
-
-# ================================================================
-# Pre-scan landscape
-# ================================================================
-scan_landscape() {
-  step "1. Port landscape scan"
-  echo "  Inspecting default ports before prompting anything."
+handle_orphans() {
+  local compose_file="$1" project="$2" label="$3"
+  
+  local services
+  services=$(docker compose -f "$compose_file" config --services 2>&1)
+  
+  local all_containers
+  all_containers=$(docker ps -a --filter "label=com.docker.compose.project=$project" --format '{{.Names}}' 2>&1)
+  
+  local orphans=""
+  for c in $all_containers; do
+    local svc
+    svc=$(docker inspect --format '{{index .Config.Labels "com.docker.compose.service"}}' "$c" 2>&1)
+    if [ -z "$svc" ] || ! echo "$services" | grep -qx "$svc"; then
+      orphans="$orphans $c"
+    fi
+  done
+  
+  [ -z "$orphans" ] && { ok "$label: no orphans"; return 0; }
+  
   echo ""
-  printf "  %-12s %-6s %-30s %s\n" "SERVICE" "PORT" "OWNER" "REUSABLE?"
-  printf "  %-12s %-6s %-30s %s\n" "--------" "----" "-----" "---------"
-
-  local svc port owner reusable status
-  for pair in "backend:8000" "dockge:5001" "prometheus:9090" "cadvisor:9091" "grafana:3001"; do
-    svc="${pair%%:*}"; port="${pair##*:}"
-    if ! port_in_use "$port"; then
-      printf "  %-12s %-6s %-30s %s\n" "$svc" "$port" "(free)" "—"
-      continue
-    fi
-    owner=$(port_owner "$port")
-    if [ "$svc" = "backend" ]; then
-      status="no (unique)"
-    else
-      reusable=$(detect_service_container "$svc")
-      [ -n "$reusable" ] && status="YES" || status="no (different svc)"
-    fi
-    printf "  %-12s %-6s %-30s %s\n" "$svc" "$port" "$owner" "$status"
+  echo "  ⚠️  Orphan containers in project '$project' ($label):"
+  echo ""
+  printf "      %-32s %-32s %s\n" "NAME" "IMAGE" "STATUS"
+  printf "      %-32s %-32s %s\n" "----" "-----" "------"
+  for c in $orphans; do
+    local img state
+    img=$(docker inspect --format '{{.Config.Image}}' "$c" 2>&1)
+    state=$(docker inspect --format '{{.State.Status}}' "$c" 2>&1)
+    printf "      %-32s %-32s %s\n" "$c" "$img" "$state"
   done
   echo ""
+  echo "  These containers share project label '$project' but are not"
+  echo "  defined in $compose_file."
+  echo ""
+  echo "  Orphan handling options:"
+  echo "    [K] Keep all — leave them running (default)"
+  echo "    [A] Auto — remove all orphans (docker rm -f)"
+  echo "    [M] Manual — I'll run commands myself"
+  echo "    [P] Per-container interactive decisions"
+  printf "  Choice [K/a/m/p] (Enter=K, 15s auto): "
+  local choice=""; read -t 15 -r choice; echo ""
+  choice="${choice:-K}"
+  
+  case "$choice" in
+    [Aa]*)
+      for c in $orphans; do
+        echo "  Removing $c ..."
+        docker rm -f "$c" &>/dev/null && ok "Removed $c" || fail "Could not remove $c"
+      done
+      ;;
+    [Mm]*)
+      echo ""
+      echo "  Run these commands to clean up manually:"
+      for c in $orphans; do
+        echo "    docker stop   $c && docker rm   $c"
+      done
+      echo ""
+      echo "  Or, if you want to keep them but silence the warning:"
+      echo "    docker update --label-add com.docker.compose.project=external $c"
+      ;;
+    [Pp]*)
+      for c in $orphans; do
+        local img state
+        img=$(docker inspect --format '{{.Config.Image}}' "$c" 2>&1)
+        state=$(docker inspect --format '{{.State.Status}}' "$c" 2>&1)
+        echo ""
+        echo "  $c ($img, $state)"
+        echo "    [K] Keep"
+        echo "    [S] Stop"
+        echo "    [R] Stop and remove"
+        echo "    [N] Reconnect to another project label"
+        printf "    Choice [K/s/r/n]: "
+        local c2=""; read -t 15 -r c2; c2="${c2:-K}"
+        case "$c2" in
+          [Ss]*) docker stop "$c" &>/dev/null && ok "Stopped $c" ;;
+          [Rr]*) docker stop "$c" &>/dev/null; docker rm "$c" &>/dev/null && ok "Removed $c" ;;
+          [Nn]*) docker update --label-add "com.docker.compose.project=orphan-$(date +%s)" "$c" &>/dev/null \
+                   && ok "Retagged $c as orphan-<timestamp>" ;;
+          *) ok "Kept $c" ;;
+        esac
+      done
+      ;;
+    *)
+      info "Keeping all orphans (use 'docker compose up -d --remove-orphans' later to clean)"
+      ;;
+  esac
 }
 
 # ================================================================
-# Smart port resolution — only prompt when there's a real decision
+# Container-name resolution — called BEFORE emitting compose
 # ================================================================
-resolve_port() {
-  local service="$1" label="$2" default="$3" current="$4"
-  local svc_upper; svc_upper=$(echo "$service" | tr '[:lower:]' '[:upper:]')
-  local skip_var="SKIP_$svc_upper"
-  local ex_var="EXISTING_${svc_upper}_PORT"
-
-  # 1. Try saved value from .env (silent if still free)
-  if [ "$FORCE_PORTS" != "yes" ] && [ -n "$current" ] && ! port_in_use "$current"; then
-    eval "$skip_var=no"; eval "$ex_var=\"\""
-    echo "$current"; return
+# If a container named <svc> exists:
+#   • same image  → mark REUSE (skip starting ours)
+#   • diff image  → rename ours to <repo>-<svc>
+# Sets: SVC_CONTAINER_NAME, SVC_REUSE_ACTION (run|reuse)
+resolve_container_name() {
+  local svc="$1" default="$1"
+  local name_var="${svc^^}_CONTAINER_NAME"
+  local reuse_var="REUSE_${svc^^}"
+  
+  # Only Dockge has a default hardcoded name worth checking
+  if ! detect_name_conflict "$default"; then
+    eval "$name_var=\"$default\""
+    eval "$reuse_var=\"no\""
+    return
   fi
-
-  # 2. If default is free → use it silently, no prompt at all
-  if [ "$FORCE_PORTS" != "yes" ] && ! port_in_use "$default"; then
-    eval "$skip_var=no"; eval "$ex_var=\"\""
-    echo "$default"; return
-  fi
-
-  # 3. Conflict — detect if there's a reusable existing service
-  local existing=""
-  [ "$service" != "backend" ] && existing=$(detect_service_container "$service")
-
-  if [ -n "$existing" ]; then
-    # Reusable conflict — need user decision
-    local ex_name ex_image ex_ports ex_port
-    ex_name=$(echo "$existing" | head -n1 | cut -d'|' -f1)
-    ex_image=$(echo "$existing" | head -n1 | cut -d'|' -f2)
-    ex_ports=$(echo "$existing" | head -n1 | cut -d'|' -f3)
-    ex_port=$(extract_host_port "$ex_ports")
-    [ -z "$ex_port" ] && ex_port="$default"
-
+  
+  local img_state img state
+  img_state=$(inspect_name_conflict "$default")
+  img=$(echo "$img_state" | cut -d'|' -f1)
+  state=$(echo "$img_state" | cut -d'|' -f2)
+  
+  if echo "$img" | grep -qiE "(^|/|:)$default(:|$)"; then
+    # It IS the same service
     if [ "$NON_INTERACTIVE" = "yes" ]; then
       if [ "$AUTO_FREE" = "yes" ]; then
-        info "Replacing $service ($ex_name) per --free flag"
-        docker stop "$ex_name" &>/dev/null
-        eval "$skip_var=no"; eval "$ex_var=\"\""
-        echo "$default"
+        info "Stopping existing $default ($state) for replacement"
+        docker stop "$default" &>/dev/null; docker rm "$default" &>/dev/null
+        eval "$name_var=\"$default\""; eval "$reuse_var=\"no\""
       else
-        info "Reusing $service ($ex_name) at :$ex_port (--yes mode)"
-        eval "$skip_var=yes"; eval "$ex_var=$ex_port"
-        echo "$ex_port"
+        info "Reusing existing $default ($state)"
+        eval "$name_var=\"$default\""; eval "$reuse_var=\"yes\""
       fi
       return
     fi
-
-    # Interactive: 3-way prompt
+    
     echo "" >&2
-    echo "  $label" >&2
-    echo "    ⚠️  Existing $service detected:" >&2
-    echo "        Container: $ex_name" >&2
-    echo "        Image:     $ex_image" >&2
-    echo "        Host port: :$ex_port" >&2
+    echo "  Container '$default' already exists ($img, $state)" >&2
+    echo "  This IS a $default instance." >&2
     echo "" >&2
-    echo "    Two instances = two data stores, two admins, wasted RAM." >&2
+    echo "    [R] Reuse existing — skip starting ours" >&2
+    echo "    [S] Stop and start fresh" >&2
+    echo "    [D] Remove and start fresh (destroys container state)" >&2
+    printf "  Choice [R/s/d]: " >&2
+    local c=""; read -t 15 -r c; c="${c:-R}"
     echo "" >&2
-    echo "    [S] Reuse existing $service on :$ex_port  (recommended)" >&2
-    echo "    [P] Pick new port — run a second $service" >&2
-    echo "    [R] Replace — stop $ex_name, run ours on :$default" >&2
-    printf "    Choice [S/p/r] (Enter=S, 15s auto): " >&2
-    local choice=""; read -t 15 -r choice; echo "" >&2
-    choice="${choice:-S}"
-    case "$choice" in
-      [Pp]*)
-        local n; n=$(find_next_free $((default + 1)))
-        info "Second $service will run on :$n" >&2
-        eval "$skip_var=no"; eval "$ex_var=\"\""
-        echo "$n"
-        ;;
-      [Rr]*)
-        info "Stopping $ex_name to replace with ours" >&2
-        docker stop "$ex_name" &>/dev/null
-        eval "$skip_var=no"; eval "$ex_var=\"\""
-        echo "$default"
-        ;;
-      *)
-        eval "$skip_var=yes"; eval "$ex_var=$ex_port"
-        info "Will reuse existing $service at :$ex_port" >&2
-        echo "$ex_port"
-        ;;
+    case "$c" in
+      [Ss]*) docker stop "$default" &>/dev/null; eval "$name_var=\"$default\""; eval "$reuse_var=\"no\"" ;;
+      [Dd]*) docker stop "$default" &>/dev/null; docker rm "$default" &>/dev/null; eval "$name_var=\"$default\""; eval "$reuse_var=\"no\"" ;;
+      *) eval "$name_var=\"$default\""; eval "$reuse_var=\"yes\"" ;;
     esac
-    return
+  else
+    # Different image occupies the name
+    info "Container name '$default' is taken by '$img' — will name ours '${REPO_NAME}-${default}'"
+    eval "$name_var=\"${REPO_NAME}-${default}\""
+    eval "$reuse_var=\"no\""
   fi
-
-  # 4. Non-reusable conflict — auto-suggest + single-key prompt
-  local suggested; suggested=$(find_next_free $((default + 1)))
-  [ -z "$suggested" ] && suggested="$default"
-  local owner; owner=$(port_owner "$default")
-
-  if [ "$NON_INTERACTIVE" = "yes" ]; then
-    info "$label: $default busy ($owner) → using $suggested"
-    eval "$skip_var=no"; eval "$ex_var=\"\""
-    echo "$suggested"; return
-  fi
-
-  echo "" >&2
-  echo "  $label" >&2
-  echo "    $default busy by: $owner" >&2
-  echo "    (This is NOT a $service instance — cannot reuse.)" >&2
-  echo "    Suggested: :$suggested" >&2
-  echo "    [Enter] use $suggested  |  [s] skip this service" >&2
-  printf "    Choice: " >&2
-  local choice=""; read -t 15 -r choice; echo "" >&2
-
-  case "$choice" in
-    [Ss]*)
-      info "Skipping $service — will not run" >&2
-      eval "$skip_var=yes"; eval "$ex_var=\"\""
-      echo "0"  # sentinel
-      ;;
-    *)
-      eval "$skip_var=no"; eval "$ex_var=\"\""
-      echo "$suggested"
-      ;;
-  esac
 }
 
 # ================================================================
@@ -272,22 +272,52 @@ main() {
   git config user.name  &>/dev/null || git config user.name  "Build Script"
 
   # ----------------------------------------------------------------
-  # 1. Pre-scan
+  # 1. Container-name resolution (BEFORE ports)
   # ----------------------------------------------------------------
-  scan_landscape
+  step "1. Container name audit"
+  DOCKGE_CONTAINER_NAME=""; REUSE_DOCKGE="no"
+  PROMETHEUS_CONTAINER_NAME=""; REUSE_PROMETHEUS="no"
+  CADVISOR_CONTAINER_NAME=""; REUSE_CADVISOR="no"
+  GRAFANA_CONTAINER_NAME=""; REUSE_GRAFANA="no"
+  BACKEND_CONTAINER_NAME="proxmox-orchestrator-backend"; REUSE_BACKEND="no"
+
+  resolve_container_name "dockge"
+  resolve_container_name "prometheus"
+  resolve_container_name "cadvisor"
+  resolve_container_name "grafana"
+
+  ok "Container names resolved"
+  info "  dockge=$DOCKGE_CONTAINER_NAME  reuse=$REUSE_DOCKGE"
+  info "  prometheus=$PROMETHEUS_CONTAINER_NAME  reuse=$REUSE_PROMETHEUS"
+  info "  cadvisor=$CADVISOR_CONTAINER_NAME  reuse=$REUSE_CADVISOR"
+  info "  grafana=$GRAFANA_CONTAINER_NAME  reuse=$REUSE_GRAFANA"
 
   # ----------------------------------------------------------------
-  # 2. Resolve ports (only prompts on genuine decisions)
+  # 2. Port landscape + resolution
   # ----------------------------------------------------------------
-  step "2. Port resolution (only prompts on conflicts)"
-  SKIP_DOCKGE=no; SKIP_PROMETHEUS=no; SKIP_CADVISOR=no; SKIP_GRAFANA=no
-  EXISTING_DOCKGE_PORT=""; EXISTING_PROMETHEUS_PORT=""
-  EXISTING_CADVISOR_PORT=""; EXISTING_GRAFANA_PORT=""
+  step "2. Port landscape"
+  printf "  %-12s %-6s %-30s %s\n" "SERVICE" "PORT" "OWNER" "REUSABLE?"
+  printf "  %-12s %-6s %-30s %s\n" "--------" "----" "-----" "---------"
+  for pair in "backend:8000" "dockge:5001" "prometheus:9090" "cadvisor:9091" "grafana:3001"; do
+    svc="${pair%%:*}"; port="${pair##*:}"
+    if ! port_in_use "$port"; then
+      printf "  %-12s %-6s %-30s %s\n" "$svc" "$port" "(free)" "—"
+      continue
+    fi
+    owner_p=$(port_owner "$port")
+    local status
+    if [ "$svc" = "backend" ]; then
+      status="no (unique)"
+    else
+      existing=$(detect_service_container "$svc")
+      [ -n "$existing" ] && status="YES (image)" || status="no (different svc)"
+    fi
+    printf "  %-12s %-6s %-30s %s\n" "$svc" "$port" "$owner_p" "$status"
+  done
 
+  step "3. Port resolution"
   local BACKEND_PORT DOCKGE_PORT PROM_PORT CADVISOR_PORT GRAFANA_PORT
   local PORTS_SAVED="no"
-
-  # Load saved state (including .env.tmp from interrupted run)
   local env_source=""
   [ -f .env ] && env_source=".env"
   [ -f .env.tmp ] && env_source=".env.tmp"
@@ -303,10 +333,14 @@ main() {
         SKIP_PROMETHEUS) SKIP_PROMETHEUS="$value" ;;
         SKIP_CADVISOR) SKIP_CADVISOR="$value" ;;
         SKIP_GRAFANA)  SKIP_GRAFANA="$value" ;;
-        EXISTING_GRAFANA_PORT) EXISTING_GRAFANA_PORT="$value" ;;
+        EXISTING_DOCKGE_PORT)     EXISTING_DOCKGE_PORT="$value" ;;
         EXISTING_PROMETHEUS_PORT) EXISTING_PROMETHEUS_PORT="$value" ;;
-        EXISTING_CADVISOR_PORT) EXISTING_CADVISOR_PORT="$value" ;;
-        EXISTING_DOCKGE_PORT) EXISTING_DOCKGE_PORT="$value" ;;
+        EXISTING_CADVISOR_PORT)   EXISTING_CADVISOR_PORT="$value" ;;
+        EXISTING_GRAFANA_PORT)    EXISTING_GRAFANA_PORT="$value" ;;
+        DOCKGE_CONTAINER_NAME)     DOCKGE_CONTAINER_NAME="$value" ;;
+        PROMETHEUS_CONTAINER_NAME) PROMETHEUS_CONTAINER_NAME="$value" ;;
+        CADVISOR_CONTAINER_NAME)   CADVISOR_CONTAINER_NAME="$value" ;;
+        GRAFANA_CONTAINER_NAME)    GRAFANA_CONTAINER_NAME="$value" ;;
       esac
     done < "$env_source"
     [ -n "$BACKEND_PORT" ] && [ -n "$DOCKGE_PORT" ] && [ -n "$PROM_PORT" ] && \
@@ -314,36 +348,78 @@ main() {
     [ "$PORTS_SAVED" = "yes" ] && ok "Resuming from $env_source"
   fi
 
+  # If a service is marked REUSE via name, set skip
+  [ "$REUSE_DOCKGE" = "yes" ]     && SKIP_DOCKGE=yes
+  [ "$REUSE_PROMETHEUS" = "yes" ] && SKIP_PROMETHEUS=yes
+  [ "$REUSE_CADVISOR" = "yes" ]   && SKIP_CADVISOR=yes
+  [ "$REUSE_GRAFANA" = "yes" ]    && SKIP_GRAFANA=yes
+
+  # Extract existing port for reuse services
+  for pair in "dockge:DOCKGE" "prometheus:PROMETHEUS" "cadvisor:CADVISOR" "grafana:GRAFANA"; do
+    svc="${pair%%:*}"; var="${pair##*:}"
+    skip_var="SKIP_$var"; ex_var="EXISTING_${var}_PORT"
+    if [ "${!skip_var}" = "yes" ] && [ -z "${!ex_var}" ]; then
+      ex_port=$(docker port "$svc" 2>&1 | grep -oE ':[0-9]+' | head -1 | tr -d ':')
+      [ -n "$ex_port" ] && eval "$ex_var=$ex_port"
+    fi
+  done
+
+  # Continue with port resolution if not saved
   if [ "$PORTS_SAVED" != "yes" ]; then
-    BACKEND_PORT=$(resolve_port "backend"    "Backend API" 8000 "${BACKEND_PORT:-}")
-    save_env_partial
-    DOCKGE_PORT=$(resolve_port  "dockge"     "Dockge UI"   5001 "${DOCKGE_PORT:-}")
-    save_env_partial
-    PROM_PORT=$(resolve_port    "prometheus" "Prometheus"  9090 "${PROM_PORT:-}")
-    save_env_partial
-    CADVISOR_PORT=$(resolve_port "cadvisor"  "cAdvisor"    9091 "${CADVISOR_PORT:-}")
-    save_env_partial
-    GRAFANA_PORT=$(resolve_port "grafana"    "Grafana"     3001 "${GRAFANA_PORT:-}")
-    save_env_partial
-
-    # Handle skips reported as port=0
-    [ "$BACKEND_PORT" = "0" ] && { fail "Backend cannot be skipped"; BACKEND_PORT=8001; }
-    [ "$DOCKGE_PORT" = "0" ]  && SKIP_DOCKGE=yes
-    [ "$PROM_PORT" = "0" ]    && SKIP_PROMETHEUS=yes
-    [ "$CADVISOR_PORT" = "0" ] && SKIP_CADVISOR=yes
-    [ "$GRAFANA_PORT" = "0" ] && SKIP_GRAFANA=yes
-
-    save_env_partial
-    mv .env.tmp .env
-    ok ".env finalized"
-    info "  Backend=$BACKEND_PORT  Dockge=$( [ "$SKIP_DOCKGE" = yes ] && echo SKIP || echo $DOCKGE_PORT )"
-    info "  Prom=$( [ "$SKIP_PROMETHEUS" = yes ] && echo SKIP || echo $PROM_PORT )  cAdv=$( [ "$SKIP_CADVISOR" = yes ] && echo SKIP || echo $CADVISOR_PORT )  Grafana=$( [ "$SKIP_GRAFANA" = yes ] && echo SKIP || echo $GRAFANA_PORT )"
+    # Simple port prompts (unchanged behavior for non-reused services)
+    ask_simple() {
+      local label="$1" default="$2" current="$3" value suggested
+      [ "$FORCE_PORTS" != "yes" ] && [ -n "$current" ] && ! port_in_use "$current" && { echo "$current"; return; }
+      [ "$FORCE_PORTS" != "yes" ] && ! port_in_use "$default" && { echo "$default"; return; }
+      suggested=$(find_next_free $((default + 1))); [ -z "$suggested" ] && suggested="$default"
+      echo "" >&2; echo "  $label" >&2
+      echo "    $default busy by: $(port_owner "$default")" >&2
+      echo "    Suggesting: :$suggested" >&2
+      printf "    Port [%s] (Enter=accept): " "$suggested" >&2
+      value=""; read -t 15 -r value; echo "" >&2
+      [ -z "$value" ] && value="$suggested"
+      port_in_use "$value" && value=$(find_next_free $((value + 1)))
+      echo "$value"
+    }
+    
+    BACKEND_PORT=$(ask_simple "Backend API" 8000 "${BACKEND_PORT:-}")
+    [ "$SKIP_DOCKGE" != "yes" ]     && DOCKGE_PORT=$(ask_simple "Dockge UI" 5001 "${DOCKGE_PORT:-}")
+    [ "$SKIP_PROMETHEUS" != "yes" ] && PROM_PORT=$(ask_simple "Prometheus" 9090 "${PROM_PORT:-}")
+    [ "$SKIP_CADVISOR" != "yes" ]   && CADVISOR_PORT=$(ask_simple "cAdvisor" 9091 "${CADVISOR_PORT:-}")
+    [ "$SKIP_GRAFANA" != "yes" ]    && GRAFANA_PORT=$(ask_simple "Grafana" 3001 "${GRAFANA_PORT:-}")
+    
+    [ -z "$DOCKGE_PORT" ] && DOCKGE_PORT=5001
+    [ -z "$PROM_PORT" ] && PROM_PORT=9090
+    [ -z "$CADVISOR_PORT" ] && CADVISOR_PORT=9091
+    [ -z "$GRAFANA_PORT" ] && GRAFANA_PORT=3001
   fi
 
+  cat > .env <<EOF
+# Ports & reuse decisions
+BACKEND_PORT=$BACKEND_PORT
+DOCKGE_PORT=$DOCKGE_PORT
+PROMETHEUS_PORT=$PROM_PORT
+CADVISOR_PORT=$CADVISOR_PORT
+GRAFANA_PORT=$GRAFANA_PORT
+SKIP_DOCKGE=${SKIP_DOCKGE:-no}
+SKIP_PROMETHEUS=${SKIP_PROMETHEUS:-no}
+SKIP_CADVISOR=${SKIP_CADVISOR:-no}
+SKIP_GRAFANA=${SKIP_GRAFANA:-no}
+EXISTING_DOCKGE_PORT=${EXISTING_DOCKGE_PORT:-}
+EXISTING_PROMETHEUS_PORT=${EXISTING_PROMETHEUS_PORT:-}
+EXISTING_CADVISOR_PORT=${EXISTING_CADVISOR_PORT:-}
+EXISTING_GRAFANA_PORT=${EXISTING_GRAFANA_PORT:-}
+DOCKGE_CONTAINER_NAME=${DOCKGE_CONTAINER_NAME:-dockge}
+PROMETHEUS_CONTAINER_NAME=${PROMETHEUS_CONTAINER_NAME:-prometheus}
+CADVISOR_CONTAINER_NAME=${CADVISOR_CONTAINER_NAME:-cadvisor}
+GRAFANA_CONTAINER_NAME=${GRAFANA_CONTAINER_NAME:-grafana}
+EOF
+  ok ".env written"
+
   # ----------------------------------------------------------------
-  # 3. Git
+  # 4. Git setup
   # ----------------------------------------------------------------
-  step "3. Git repository"
+  step "4. Git repository"
   if [ ! -d .git ]; then
     git init -b main || fail "git init failed"
   else
@@ -353,23 +429,18 @@ main() {
   ok "Git ready on 'main'"
 
   # ----------------------------------------------------------------
-  # 4. Emit project files
+  # 5. Emit project files
   # ----------------------------------------------------------------
-  step "4. Emitting project files"
+  step "5. Emitting project files"
   mkdir -p backend terraform ansible frontend/src frontend/public \
            monitoring/prometheus monitoring/dockge backend/data
 
   cat > README.txt <<'EOF'
 PROXMOX REMOTE ORCHESTRATION ENGINE
-See .env for ports and reuse decisions.
-Backend: FastAPI (unique, always started)
-Monitoring: Dockge, Prometheus, cAdvisor, Grafana (reusable if already running)
+See .env for ports, container names, and reuse decisions.
 
-Flags:
-  -y, --yes             non-interactive (auto-reuse compatible services)
-  -p, --ports           force re-pick every port
-  -f, --free            stop conflicting containers and replace
-  -m, --skip-monitoring skip all monitoring (backend only)
+The monitoring compose uses its own project name (repo-monitoring) so it
+never inherits orphans from the main project.
 EOF
 
   cat > backend/requirements.txt <<'EOF'
@@ -443,41 +514,31 @@ from proxmox_client import get_proxmox_connection, is_proxmox_configured
 
 app = FastAPI()
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
-
 class DeploymentRequest(BaseModel):
     name: str; type: str; node: str; cores: int = 2; memory: int = 2048
-
 @app.on_event("startup")
 def startup_event(): init_db()
-
 @app.get("/api/health")
 def health(): return {"status": "ok"}
-
 @app.get("/api/status")
 def status():
-    configured = is_proxmox_configured()
-    connected = False; detail = ""
+    configured = is_proxmox_configured(); connected = False; detail = ""
     if configured:
         try: get_proxmox_connection().version.get(); connected = True
         except Exception as e: detail = str(e)
     return {"backend":"ok","proxmox_configured":configured,"proxmox_connected":connected,"detail":detail}
-
 @app.get("/api/nodes")
 def list_nodes():
     if not is_proxmox_configured():
         return {"nodes":[],"proxmox_available":False,"message":"Proxmox not configured"}
-    try:
-        return {"nodes": get_proxmox_connection().nodes.get(), "proxmox_available": True}
-    except Exception as e:
-        return {"nodes":[],"proxmox_available":False,"message":str(e)}
-
+    try: return {"nodes": get_proxmox_connection().nodes.get(), "proxmox_available": True}
+    except Exception as e: return {"nodes":[],"proxmox_available":False,"message":str(e)}
 @app.post("/api/deploy")
 def trigger_deployment(req: DeploymentRequest):
     if not is_proxmox_configured(): raise HTTPException(503, "Proxmox not configured")
     try: get_proxmox_connection().version.get()
     except Exception as e: raise HTTPException(503, f"Proxmox unreachable: {e}")
-    conn = get_db_connection()
-    cur = conn.cursor()
+    conn = get_db_connection(); cur = conn.cursor()
     cur.execute("INSERT INTO deployments (name,type,target_node,status) VALUES (?,?,?,?)",
                 (req.name, req.type, req.node, "PENDING"))
     conn.commit(); dep_id = cur.lastrowid; conn.close()
@@ -489,8 +550,7 @@ def trigger_deployment(req: DeploymentRequest):
         for cmd, t in [(["terraform","init","-upgrade"], 120),
                        (["terraform","apply","-auto-approve"], 600)]:
             p = subprocess.Popen(cmd, cwd="/app/terraform", env=env,
-                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                 start_new_session=True)
+                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True)
             _, err = p.communicate(timeout=t)
             if p.returncode != 0: raise RuntimeError(err.decode())
         conn = get_db_connection()
@@ -502,7 +562,6 @@ def trigger_deployment(req: DeploymentRequest):
         conn.execute("UPDATE deployments SET status=? WHERE id=?", ("FAILED", dep_id))
         conn.commit(); conn.close()
         raise HTTPException(500, str(e))
-
 @app.get("/api/deployments")
 def get_deployments():
     conn = get_db_connection()
@@ -519,8 +578,7 @@ ARG TERRAFORM_VERSION=1.17.1
 RUN curl -fsSLo /tmp/terraform.zip \
     "https://releases.hashicorp.com/terraform/${TERRAFORM_VERSION}/terraform_${TERRAFORM_VERSION}_linux_amd64.zip" \
     && unzip /tmp/terraform.zip -d /usr/local/bin \
-    && chmod +x /usr/local/bin/terraform \
-    && rm /tmp/terraform.zip
+    && chmod +x /usr/local/bin/terraform && rm /tmp/terraform.zip
 RUN pip install --no-cache-dir ansible-core==2.17.3
 WORKDIR /app
 COPY requirements.txt .
@@ -563,22 +621,15 @@ resource "proxmox_lxc" "container" {
   target_node  = var.target_node
   hostname     = var.instance_name
   ostemplate   = "local:vztmpl/debian-12-standard_12.2-1_amd64.zst"
-  cores        = var.cores
-  memory       = var.memory
-  unprivileged = true
-  start        = true
+  cores = var.cores; memory = var.memory; unprivileged = true; start = true
   rootfs { storage = "local-lvm"; size = "8G" }
   network { name = "eth0"; bridge = "vmbr0"; ip = "dhcp" }
 }
 resource "proxmox_vm_qemu" "vm" {
-  count       = var.instance_type == "vm" ? 1 : 0
-  name        = var.instance_name
-  target_node = var.target_node
-  clone       = "debian-12-template"
-  cores       = var.cores
-  memory      = var.memory
-  agent       = 1
-  os_type     = "cloud-init"
+  count = var.instance_type == "vm" ? 1 : 0
+  name = var.instance_name; target_node = var.target_node
+  clone = "debian-12-template"; cores = var.cores; memory = var.memory
+  agent = 1; os_type = "cloud-init"
   disk { size = "10G"; type = "scsi"; storage = "local-lvm" }
   network { model = "virtio"; bridge = "vmbr0" }
 }
@@ -600,9 +651,7 @@ EOF
     - firewalld:
         zone: drop
         rich_rule: 'rule family="ipv4" source address="192.168.0.0/16" service name="ssh" accept'
-        permanent: yes
-        immediate: yes
-        state: enabled
+        permanent: yes; immediate: yes; state: enabled
     - lineinfile:
         path: /etc/ssh/sshd_config
         regexp: '^#?PermitRootLogin'
@@ -706,9 +755,7 @@ export default function App() {
         <thead><tr><th>ID</th><th>Name</th><th>Type</th><th>Node</th><th>Status</th><th>Timestamp</th></tr></thead>
         <tbody>
           {deployments.length === 0 && <tr><td colSpan="6" style={{ textAlign: 'center' }}>No deployments.</td></tr>}
-          {deployments.map(d => (
-            <tr key={d.id}><td>{d.id}</td><td>{d.name}</td><td>{d.type}</td><td>{d.target_node}</td><td>{d.status}</td><td>{d.created_at}</td></tr>
-          ))}
+          {deployments.map(d => (<tr key={d.id}><td>{d.id}</td><td>{d.name}</td><td>{d.type}</td><td>{d.target_node}</td><td>{d.status}</td><td>{d.created_at}</td></tr>))}
         </tbody>
       </table>
     </div>
@@ -738,20 +785,20 @@ services:
       - ./ansible:/app/ansible
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/api/health"]
-      interval: 30s
-      timeout: 5s
-      retries: 3
-      start_period: 10s
+      interval: 30s; timeout: 5s; retries: 3; start_period: 10s
     networks: [ orchestrator_net ]
 networks:
   orchestrator_net: { driver: bridge }
 EOF
 
+  # Monitoring compose — SEPARATE PROJECT NAME + configurable container names
   cat > docker-compose.monitoring.yml <<'EOF'
+name: repo-monitoring
+
 services:
   dockge:
     image: louislam/dockge:1.5.0
-    container_name: dockge
+    container_name: ${DOCKGE_CONTAINER_NAME:-dockge}
     restart: unless-stopped
     ports: [ "${DOCKGE_PORT:-5001}:5001" ]
     volumes:
@@ -763,21 +810,19 @@ services:
 
   prometheus:
     image: prom/prometheus:v3.15.1
-    container_name: prometheus
+    container_name: ${PROMETHEUS_CONTAINER_NAME:-prometheus}
     restart: unless-stopped
     ports: [ "${PROMETHEUS_PORT:-9090}:9090" ]
     volumes:
       - ./monitoring/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
       - prom-data:/prometheus
-    command:
-      - '--config.file=/etc/prometheus/prometheus.yml'
-      - '--storage.tsdb.retention.time=7d'
+    command: [ '--config.file=/etc/prometheus/prometheus.yml', '--storage.tsdb.retention.time=7d' ]
     networks: [ monitoring ]
     extra_hosts: [ "host.docker.internal:host-gateway" ]
 
   cadvisor:
     image: ghcr.io/google/cadvisor:v0.60.6
-    container_name: cadvisor
+    container_name: ${CADVISOR_CONTAINER_NAME:-cadvisor}
     restart: unless-stopped
     ports: [ "${CADVISOR_PORT:-9091}:8080" ]
     volumes:
@@ -792,7 +837,7 @@ services:
 
   grafana:
     image: grafana/grafana:12.4.2
-    container_name: grafana
+    container_name: ${GRAFANA_CONTAINER_NAME:-grafana}
     restart: unless-stopped
     ports: [ "${GRAFANA_PORT:-3001}:3000" ]
     environment:
@@ -810,7 +855,7 @@ networks:
   monitoring: { driver: bridge }
 EOF
 
-  if [ "$SKIP_CADVISOR" = "yes" ] && [ -n "$EXISTING_CADVISOR_PORT" ]; then
+  if [ "${SKIP_CADVISOR:-no}" = "yes" ] && [ -n "${EXISTING_CADVISOR_PORT:-}" ]; then
     CADVISOR_TARGET="host.docker.internal:${EXISTING_CADVISOR_PORT}"
   else
     CADVISOR_TARGET="cadvisor:8080"
@@ -822,12 +867,10 @@ global:
   evaluation_interval: 15s
 scrape_configs:
   - job_name: 'prometheus'
-    static_configs:
-      - targets: ['localhost:9090']
+    static_configs: [ { targets: ['localhost:9090'] } ]
   - job_name: 'cadvisor'
     scrape_interval: 5s
-    static_configs:
-      - targets: ['$CADVISOR_TARGET']
+    static_configs: [ { targets: ['$CADVISOR_TARGET'] } ]
 EOF
 
   cat > .gitignore <<'EOF'
@@ -856,13 +899,19 @@ EOF
   ok "All project files emitted"
 
   # ----------------------------------------------------------------
-  # 5. Commit + push
+  # 6. Orphan handling (main project only — monitoring isolated)
   # ----------------------------------------------------------------
-  step "5. Commit + push"
+  step "6. Orphan check (main project 'repo')"
+  handle_orphans "docker-compose.yml" "repo" "main"
+
+  # ----------------------------------------------------------------
+  # 7. Commit + push
+  # ----------------------------------------------------------------
+  step "7. Commit + push"
   git add -A
   git diff --cached --quiet && ok "No changes" || { git commit -m "Build: sync" || fail "commit failed"; ok "Committed"; }
 
-  step "6. GitHub repo"
+  step "8. GitHub repo"
   if gh repo view "$owner/$REPO_NAME" &>/dev/null; then ok "Repo exists"
   else gh repo create "$REPO_NAME" --public --source=. --remote=origin --push || fail "create failed"; fi
   git remote get-url origin &>/dev/null || git remote add origin "https://github.com/$owner/$REPO_NAME.git"
@@ -870,9 +919,9 @@ EOF
   ok "Pushed main"
 
   # ----------------------------------------------------------------
-  # 7. Frontend build + gh-pages
+  # 9. Frontend + gh-pages + Pages
   # ----------------------------------------------------------------
-  step "7. Frontend + gh-pages"
+  step "9. Frontend"
   if pushd frontend &>/dev/null; then
     if [ ! -f package-lock.json ]; then
       npm install --legacy-peer-deps || fail "npm install failed"
@@ -889,8 +938,7 @@ EOF
     popd &>/dev/null
     ok "gh-pages pushed"
   fi
-
-  step "8. Wait for gh-pages + enable Pages"
+  step "10. Wait for gh-pages + enable Pages"
   local waited=0 found=""
   while [ "$waited" -lt 60 ]; do
     git ls-remote --exit-code --heads origin "$PAGES_BRANCH" &>/dev/null && { found="yes"; break; }
@@ -914,11 +962,11 @@ JSON
   fi
 
   # ----------------------------------------------------------------
-  # 9. Backend
+  # 11. Backend
   # ----------------------------------------------------------------
-  step "9. Backend"
+  step "11. Backend"
   docker compose build backend || fail "build failed"
-  docker compose up -d || fail "up failed"
+  docker compose up -d --remove-orphans backend || fail "up failed"
   local hwaited=0 healthy=""
   while [ "$hwaited" -lt 60 ]; do
     curl -fsS --max-time 5 "http://localhost:$BACKEND_PORT/api/health" &>/dev/null && { healthy="yes"; break; }
@@ -927,38 +975,41 @@ JSON
   [ -n "$healthy" ] && ok "Backend healthy after ${hwaited}s" || fail "Backend not healthy"
 
   # ----------------------------------------------------------------
-  # 10. Monitoring (only start non-skipped)
+  # 12. Monitoring (isolated project)
   # ----------------------------------------------------------------
-  step "10. Monitoring stack"
-  for svc in dockge prometheus cadvisor grafana; do
-    svc_upper=$(echo "$svc" | tr '[:lower:]' '[:upper:]')
-    skip_var="SKIP_$svc_upper"
-    ex_var="EXISTING_${svc_upper}_PORT"
-    if [ "$SKIP_MONITORING" = "yes" ] || [ "${!skip_var}" = "yes" ]; then
-      ex="${!ex_var}"
-      [ -n "$ex" ] && info "$svc: reusing existing at :$ex" || info "$svc: skipped"
-    else
-      docker compose -f docker-compose.monitoring.yml up -d "$svc" \
-        && ok "$svc started" || fail "$svc failed"
-    fi
-  done
-
-  wait_http() {
-    local url="$1" label="$2" waited=0
-    while [ "$waited" -lt 60 ]; do
-      curl -fsS --max-time 5 "$url" &>/dev/null && { ok "$label OK"; return 0; }
-      sleep 2; waited=$((waited + 2))
+  step "12. Monitoring stack"
+  if [ "$SKIP_MONITORING" = "yes" ]; then
+    info "Monitoring skipped (--skip-monitoring)"
+  else
+    for svc in dockge prometheus cadvisor grafana; do
+      svc_upper=$(echo "$svc" | tr '[:lower:]' '[:upper:]')
+      skip_var="SKIP_$svc_upper"
+      ex_var="EXISTING_${svc_upper}_PORT"
+      if [ "${!skip_var}" = "yes" ]; then
+        ex="${!ex_var}"
+        [ -n "$ex" ] && info "$svc: reusing existing at :$ex" || info "$svc: skipped"
+      else
+        docker compose -f docker-compose.monitoring.yml up -d "$svc" \
+          && ok "$svc started" || fail "$svc failed"
+      fi
     done
-    fail "$label not reachable ($url)"
-  }
-  [ "$SKIP_MONITORING" = "yes" ] && info "Monitoring skipped (--skip-monitoring)"
-  [ "$SKIP_MONITORING" != "yes" ] && [ "$SKIP_DOCKGE" != "yes" ]     && wait_http "http://localhost:$DOCKGE_PORT"             "Dockge"
-  [ "$SKIP_MONITORING" != "yes" ] && [ "$SKIP_PROMETHEUS" != "yes" ] && wait_http "http://localhost:$PROM_PORT/-/healthy"     "Prometheus"
-  [ "$SKIP_MONITORING" != "yes" ] && [ "$SKIP_CADVISOR" != "yes" ]   && wait_http "http://localhost:$CADVISOR_PORT/healthz"   "cAdvisor"
-  [ "$SKIP_MONITORING" != "yes" ] && [ "$SKIP_GRAFANA" != "yes" ]    && wait_http "http://localhost:$GRAFANA_PORT/api/health" "Grafana"
+    
+    wait_http() {
+      local url="$1" label="$2" w=0
+      while [ "$w" -lt 60 ]; do
+        curl -fsS --max-time 5 "$url" &>/dev/null && { ok "$label OK"; return 0; }
+        sleep 2; w=$((w + 2))
+      done
+      fail "$label not reachable ($url)"
+    }
+    [ "$SKIP_DOCKGE" != "yes" ]     && wait_http "http://localhost:$DOCKGE_PORT"             "Dockge"
+    [ "$SKIP_PROMETHEUS" != "yes" ] && wait_http "http://localhost:$PROM_PORT/-/healthy"     "Prometheus"
+    [ "$SKIP_CADVISOR" != "yes" ]   && wait_http "http://localhost:$CADVISOR_PORT/healthz"   "cAdvisor"
+    [ "$SKIP_GRAFANA" != "yes" ]    && wait_http "http://localhost:$GRAFANA_PORT/api/health" "Grafana"
+  fi
 
   # ----------------------------------------------------------------
-  # 11. Summary
+  # 13. Summary
   # ----------------------------------------------------------------
   step "Summary"
   local PAGES_URL="https://$owner.github.io/$REPO_NAME/"
@@ -967,26 +1018,17 @@ JSON
     echo ""
     echo "  Pages:    $PAGES_URL"
     echo "  Backend:  http://localhost:$BACKEND_PORT/api/health"
-    if [ "$SKIP_DOCKGE" = "yes" ]; then
-      [ -n "$EXISTING_DOCKGE_PORT" ] && echo "  Dockge:   REUSED (existing at :$EXISTING_DOCKGE_PORT)" || echo "  Dockge:   skipped"
-    else
-      echo "  Dockge:   http://localhost:$DOCKGE_PORT"
-    fi
-    if [ "$SKIP_PROMETHEUS" = "yes" ]; then
-      [ -n "$EXISTING_PROMETHEUS_PORT" ] && echo "  Prom:     REUSED (existing at :$EXISTING_PROMETHEUS_PORT)" || echo "  Prom:     skipped"
-    else
-      echo "  Prom:     http://localhost:$PROM_PORT"
-    fi
-    if [ "$SKIP_CADVISOR" = "yes" ]; then
-      [ -n "$EXISTING_CADVISOR_PORT" ] && echo "  cAdv:     REUSED (existing at :$EXISTING_CADVISOR_PORT)" || echo "  cAdv:     skipped"
-    else
-      echo "  cAdv:     http://localhost:$CADVISOR_PORT"
-    fi
-    if [ "$SKIP_GRAFANA" = "yes" ]; then
-      [ -n "$EXISTING_GRAFANA_PORT" ] && echo "  Grafana:  REUSED (existing at :$EXISTING_GRAFANA_PORT)" || echo "  Grafana:  skipped"
-    else
-      echo "  Grafana:  http://localhost:$GRAFANA_PORT  (admin / change-me-now)"
-    fi
+    echo ""
+    echo "  Monitoring services:"
+    for pair in "dockge:DOCKGE:Dockge" "prometheus:PROMETHEUS:Prometheus" "cadvisor:CADVISOR:cAdvisor" "grafana:GRAFANA:Grafana"; do
+      svc="${pair%%:*}"; var="${pair##*:}"; name=$(echo "$svc" | awk '{print toupper(substr($0,1,1)) substr($0,2)}')
+      skip_var="SKIP_$var"; ex_var="EXISTING_${var}_PORT"; port_var="${var}_PORT"
+      if [ "${!skip_var}" = "yes" ]; then
+        [ -n "${!ex_var}" ] && echo "    $name:  REUSED (existing on :${!ex_var})" || echo "    $name:  skipped"
+      else
+        echo "    $name:  http://localhost:${!port_var}"
+      fi
+    done
     echo ""
     curl -s --max-time 5 "http://localhost:$BACKEND_PORT/api/status" | python3 -m json.tool 2>&1 || true
     if   command -v xdg-open &>/dev/null; then xdg-open "$PAGES_URL" &>/dev/null &

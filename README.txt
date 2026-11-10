@@ -1,10 +1,5 @@
 PROXMOX REMOTE ORCHESTRATION ENGINE
-See .env for ports and reuse decisions.
-Backend: FastAPI (unique, always started)
-Monitoring: Dockge, Prometheus, cAdvisor, Grafana (reusable if already running)
+See .env for ports, container names, and reuse decisions.
 
-Flags:
-  -y, --yes             non-interactive (auto-reuse compatible services)
-  -p, --ports           force re-pick every port
-  -f, --free            stop conflicting containers and replace
-  -m, --skip-monitoring skip all monitoring (backend only)
+The monitoring compose uses its own project name (repo-monitoring) so it
+never inherits orphans from the main project.

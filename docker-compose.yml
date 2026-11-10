@@ -12,10 +12,7 @@ services:
       - ./ansible:/app/ansible
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/api/health"]
-      interval: 30s
-      timeout: 5s
-      retries: 3
-      start_period: 10s
+      interval: 30s; timeout: 5s; retries: 3; start_period: 10s
     networks: [ orchestrator_net ]
 networks:
   orchestrator_net: { driver: bridge }

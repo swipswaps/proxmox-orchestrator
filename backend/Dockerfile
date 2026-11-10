@@ -5,8 +5,7 @@ ARG TERRAFORM_VERSION=1.17.1
 RUN curl -fsSLo /tmp/terraform.zip \
     "https://releases.hashicorp.com/terraform/${TERRAFORM_VERSION}/terraform_${TERRAFORM_VERSION}_linux_amd64.zip" \
     && unzip /tmp/terraform.zip -d /usr/local/bin \
-    && chmod +x /usr/local/bin/terraform \
-    && rm /tmp/terraform.zip
+    && chmod +x /usr/local/bin/terraform && rm /tmp/terraform.zip
 RUN pip install --no-cache-dir ansible-core==2.17.3
 WORKDIR /app
 COPY requirements.txt .
