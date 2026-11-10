@@ -1,18 +1,4 @@
-<!DOCTYPE html>
-<html>
-<head>
-  <meta charset="utf-8">
-  <title>Redirecting…</title>
-  <script>
-    (function () {
-      var segs = location.pathname.split('/').filter(Boolean);
-      if (segs.length > 0) {
-        location.replace('/' + segs[0] + '/');
-      } else {
-        location.replace('/');
-      }
-    })();
-  </script>
-</head>
-<body><p>Redirecting to <a href="/">home</a>…</p></body>
-</html>
+<!DOCTYPE html><html><head><meta charset="utf-8"><script>
+(function(){var s=location.pathname.split('/').filter(Boolean);
+s.length>0?location.replace('/'+s[0]+'/'):location.replace('/');})();
+</script></head><body></body></html>
