@@ -9,10 +9,8 @@ def init_db():
     conn = get_db_connection()
     with conn:
         conn.execute("""CREATE TABLE IF NOT EXISTS deployments (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT NOT NULL,
+            id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL,
             type TEXT NOT NULL CHECK(type IN ('lxc','vm')),
-            target_node TEXT NOT NULL,
-            status TEXT NOT NULL DEFAULT 'PENDING',
+            target_node TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'PENDING',
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)""")
     conn.close()

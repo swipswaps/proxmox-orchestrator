@@ -9,8 +9,7 @@ export default function App() {
     fetch(`${API_BASE}/api/health`, { signal: c.signal })
       .then(r => { if (!r.ok) return; return fetch(`${API_BASE}/api/status`).then(r2 => r2.json()); })
       .then(s => { if (s) setState({ loading: false, backendOnline: true, proxmoxConfigured: s.proxmox_configured, proxmoxConnected: s.proxmox_connected, detail: s.detail || '' }); })
-      .catch(() => setState(prev => ({ ...prev, loading: false })))
-      .finally(() => clearTimeout(t));
+      .catch(() => setState(prev => ({ ...prev, loading: false }))).finally(() => clearTimeout(t));
   }, []);
   useEffect(() => {
     if (!state.backendOnline) return;

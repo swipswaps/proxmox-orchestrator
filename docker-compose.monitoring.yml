@@ -21,7 +21,9 @@ services:
     volumes:
       - ./monitoring/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
       - prom-data:/prometheus
-    command: [ '--config.file=/etc/prometheus/prometheus.yml', '--storage.tsdb.retention.time=7d' ]
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.retention.time=7d'
     networks: [ monitoring ]
     extra_hosts: [ "host.docker.internal:host-gateway" ]
 
@@ -57,4 +59,5 @@ volumes:
   grafana-data:
 
 networks:
-  monitoring: { driver: bridge }
+  monitoring:
+    driver: bridge

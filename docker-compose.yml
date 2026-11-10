@@ -1,18 +1,27 @@
 services:
   backend:
     image: proxmox-orchestrator-backend
-    build: { context: ./backend }
+    build:
+      context: ./backend
     container_name: proxmox-orchestrator-backend
     restart: unless-stopped
-    env_file: [ backend/.env ]
-    ports: [ "${BACKEND_PORT:-8000}:8000" ]
+    env_file:
+      - backend/.env
+    ports:
+      - "${BACKEND_PORT:-8000}:8000"
     volumes:
       - ./backend/data:/app/data
       - ./terraform:/app/terraform
       - ./ansible:/app/ansible
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/api/health"]
-      interval: 30s; timeout: 5s; retries: 3; start_period: 10s
-    networks: [ orchestrator_net ]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    networks:
+      - orchestrator_net
+
 networks:
-  orchestrator_net: { driver: bridge }
+  orchestrator_net:
+    driver: bridge

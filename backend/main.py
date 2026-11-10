@@ -59,5 +59,4 @@ def trigger_deployment(req: DeploymentRequest):
 def get_deployments():
     conn = get_db_connection()
     rows = conn.execute("SELECT * FROM deployments ORDER BY created_at DESC").fetchall()
-    conn.close()
-    return [dict(r) for r in rows]
+    conn.close(); return [dict(r) for r in rows]
