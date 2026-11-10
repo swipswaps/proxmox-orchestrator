@@ -12,6 +12,11 @@ dist/
 *.tfvars
 *.retry
 .env
-.env.tmp
 *.bak
 .DS_Store
+
+# Chat log files from the parent workflow — never commit these
+*_0001.txt
+*_0002.txt
+*_0003.txt
+*_0004.txt
