@@ -1,0 +1,36 @@
+- hosts: all
+  become: yes
+  tasks:
+    - name: Ensure firewalld is installed
+      dnf: { name: firewalld, state: present }
+    - name: Default firewall zone to drop
+      firewalld: { zone: drop, state: enabled, permanent: yes, immediate: yes }
+    - name: Allow SSH from local subnet
+      firewalld:
+        zone: drop
+        rich_rule: 'rule family="ipv4" source address="192.168.0.0/16" service name="ssh" accept'
+        permanent: yes
+        immediate: yes
+        state: enabled
+    - name: Disable root SSH login
+      lineinfile: { path: /etc/ssh/sshd_config, regexp: '^PermitRootLogin', line: 'PermitRootLogin no' }
+      notify: restart sshd
+    - name: Disable password authentication
+      lineinfile: { path: /etc/ssh/sshd_config, regexp: '^PasswordAuthentication', line: 'PasswordAuthentication no' }
+      notify: restart sshd
+    - name: Validate sshd configuration
+      command: sshd -t
+      register: sshd_test
+      failed_when: sshd_test.rc != 0
+      changed_when: false
+      listen: "restart sshd"
+    - name: SELinux enforcing
+      selinux: { policy: targeted, state: enforcing }
+    - name: dnf-automatic security updates
+      dnf: { name: dnf-automatic, state: present }
+      notify: enable dnf-automatic
+  handlers:
+    - name: restart sshd
+      systemd: { name: sshd, state: restarted }
+    - name: enable dnf-automatic
+      systemd: { name: dnf-automatic.timer, state: started, enabled: yes }
