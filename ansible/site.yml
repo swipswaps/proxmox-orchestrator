@@ -12,18 +12,20 @@
         permanent: yes
         immediate: yes
         state: enabled
-    - name: Disable root SSH login
-      lineinfile: { path: /etc/ssh/sshd_config, regexp: '^PermitRootLogin', line: 'PermitRootLogin no' }
+    - name: Disable root SSH login (validated before write)
+      lineinfile:
+        path: /etc/ssh/sshd_config
+        regexp: '^#?PermitRootLogin'
+        line: 'PermitRootLogin no'
+        validate: '/usr/sbin/sshd -t -f %s'
       notify: restart sshd
-    - name: Disable password authentication
-      lineinfile: { path: /etc/ssh/sshd_config, regexp: '^PasswordAuthentication', line: 'PasswordAuthentication no' }
+    - name: Disable password authentication (validated before write)
+      lineinfile:
+        path: /etc/ssh/sshd_config
+        regexp: '^#?PasswordAuthentication'
+        line: 'PasswordAuthentication no'
+        validate: '/usr/sbin/sshd -t -f %s'
       notify: restart sshd
-    - name: Validate sshd configuration
-      command: sshd -t
-      register: sshd_test
-      failed_when: sshd_test.rc != 0
-      changed_when: false
-      listen: "restart sshd"
     - name: SELinux enforcing
       selinux: { policy: targeted, state: enforcing }
     - name: dnf-automatic security updates

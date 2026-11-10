@@ -12,5 +12,4 @@ dist/
 *.tfvars
 *.retry
 .env
-*.env
 .DS_Store

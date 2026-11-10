@@ -51,6 +51,7 @@ def trigger_deployment(req: DeploymentRequest):
     })
 
     try:
+        # Popen with start_new_session=True prevents zombie processes
         init = subprocess.Popen(["terraform","init","-upgrade"], cwd="/app/terraform",
                                 env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                 start_new_session=True)

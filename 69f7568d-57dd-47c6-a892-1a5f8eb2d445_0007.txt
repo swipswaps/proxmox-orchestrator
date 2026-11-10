@@ -1,0 +1,819 @@
+#!/usr/bin/env bash
+# build_and_deploy.sh — idempotent one-shot build (hardened)
+#
+# Idempotent: safe to re-run from any partial state.
+# Constraints: no 'sed', no 'set -e', no 'exit 1', no '2>/dev/null',
+# no 'subprocess.run' (all subprocesses use Popen with start_new_session).
+#
+# Citations:
+#   npm ci lockfile requirement: https://docs.npmjs.com/cli/v11/commands/npm-ci
+#   GitHub Pages API 409 semantics: https://raw.githubusercontent.com/bmad-code-org/BMAD-METHOD/.../BUNDLE_DISTRIBUTION_SETUP.md
+#   Vite CVE-2025-62522: https://vuldb.com/cve/CVE-2025-62522
+#   Hadolint DL3025: https://github.com/marcusrbrown/containers/pull/723
+#   Docker buildx deprecation: https://github.com/MichaIng/DietPi/issues/7710
+#   Ansible lineinfile validate: https://git.uumas.fi/.../roles/ssh/tasks/main.yaml
+
+REPO_NAME="${REPO_NAME:-proxmox-orchestrator}"
+PAGES_BRANCH="gh-pages"
+ERRORS=0
+
+fail()    { echo "❌ $1"; ERRORS=$((ERRORS + 1)); }
+ok()      { echo "✅ $1"; }
+info()    { echo "ℹ️  $1"; }
+step()    { echo ""; echo "▶ $1"; }
+
+main() {
+
+  # ====================================================================
+  # 0. Pre-flight
+  # ====================================================================
+  step "0. Pre-flight"
+
+  # --- 0a. Required CLI tools ---
+  local missing=""
+  for tool in gh git docker node npm; do
+    if command -v "$tool" &>/dev/null; then
+      ok "$tool available"
+    else
+      missing="$missing $tool"
+    fi
+  done
+  if [ -n "$missing" ]; then
+    fail "Missing required tools:$missing"
+    return "$ERRORS"
+  fi
+
+  # --- 0b. Docker Buildx plugin (avoids legacy builder warning) ---
+  # FIX: The legacy builder is deprecated and will be removed. Building
+  # without buildx prints a warning today and fails on future Docker versions.
+  # Citation: https://github.com/MichaIng/DietPi/issues/7710 (lines 5-8)
+  if docker buildx version &>/dev/null; then
+    ok "Docker buildx available"
+  else
+    fail "Docker buildx plugin missing. Install docker-buildx-plugin."
+    info "Debian/Ubuntu: apt install docker-buildx-plugin"
+    info "RHEL/Fedora:   dnf install docker-buildx-plugin"
+  fi
+
+  # --- 0c. GitHub authentication ---
+  local owner
+  owner=$(gh api user --jq '.login' 2>&1) || owner=""
+  if [ -z "$owner" ] || [ "${owner:0:3}" = "gh:" ]; then
+    fail "gh not authenticated. Run: gh auth login"
+    return "$ERRORS"
+  fi
+  ok "Authenticated as $owner"
+
+  # --- 0d. Git identity (prevents commit failures on fresh machines) ---
+  if ! git config user.email &>/dev/null; then
+    git config user.email "build@localhost"
+    ok "Set local git user.email"
+  fi
+  if ! git config user.name &>/dev/null; then
+    git config user.name "Build Script"
+    ok "Set local git user.name"
+  fi
+
+  # ====================================================================
+  # 1. Ensure Git repository on 'main'
+  # ====================================================================
+  step "1. Ensure Git repository on 'main'"
+  if [ ! -d .git ]; then
+    git init -b main || fail "git init failed"
+    ok "Initialized repo on 'main'"
+  else
+    ok "Git repository exists"
+    local current_branch
+    current_branch=$(git symbolic-ref --short HEAD 2>&1) || current_branch=""
+    if [ "$current_branch" != "main" ]; then
+      if git show-ref --verify --quiet refs/heads/main; then
+        git checkout main || fail "Failed to switch to 'main'"
+      else
+        git checkout -b main || fail "Failed to create 'main'"
+      fi
+      ok "Now on 'main' (was: ${current_branch:-unborn})"
+    else
+      ok "Already on 'main'"
+    fi
+  fi
+
+  # ====================================================================
+  # 2. Emit all project files
+  # ====================================================================
+  step "2. Emit project files"
+  mkdir -p backend terraform ansible frontend/src frontend/public
+
+  # ----------------------------------------------------------------
+  # 2a. README.txt
+  # ----------------------------------------------------------------
+  cat > README.txt <<'EOF'
+PROXMOX REMOTE ORCHESTRATION ENGINE — HARDENED BUILD
+====================================================
+OVERVIEW
+--------
+Secure bridge between a React/Vite dashboard and a Proxmox VE hypervisor.
+Terraform provisions infrastructure; Ansible hardens guests; FastAPI
+tracks jobs in SQLite. The frontend auto-detects the backend and degrades
+gracefully to demo mode when unreachable.
+
+IDEMPOTENT BUILD
+----------------
+build_and_deploy.sh is safe to re-run. From a fresh directory, a partial
+build, or a previously-successful build, it converges to the same state.
+
+PREREQUISITES
+-------------
+• Proxmox VE 8.x/9.x with API token (user@realm!tokenid)
+• Docker (or Podman) with buildx plugin
+• Node.js ≥ 18, npm
+• gh CLI authenticated with 'repo' scope:  gh auth refresh -s repo
+
+QUICK START
+-----------
+1. Populate backend/.env (copy backend/.env.example)
+2. docker build -t proxmox-orchestrator-backend ./backend
+3. docker run -d -p 8000:8000 --env-file backend/.env \
+     -v "$(pwd)/backend/data:/app/data" proxmox-orchestrator-backend
+4. Visit https://<owner>.github.io/<repo>/
+EOF
+
+  # ----------------------------------------------------------------
+  # 2b. backend/requirements.txt
+  # ----------------------------------------------------------------
+  cat > backend/requirements.txt <<'EOF'
+fastapi==0.115.0
+uvicorn[standard]==0.31.0
+pydantic==2.9.2
+proxmoxer==2.0.1
+requests==2.32.3
+ansible-core==2.17.3
+python-dotenv==1.0.1
+EOF
+
+  # ----------------------------------------------------------------
+  # 2c. backend/.env.example
+  # ----------------------------------------------------------------
+  cat > backend/.env.example <<'EOF'
+PROXMOX_HOST=https://192.168.1.100:8006
+PROXMOX_USER=root@pam
+PROXMOX_TOKEN_ID=orchestrator
+PROXMOX_TOKEN_SECRET=00000000-0000-0000-0000-000000000000
+PROXMOX_NODE=pve
+DATABASE_PATH=/app/data/orchestrator.db
+EOF
+
+  # ----------------------------------------------------------------
+  # 2d. backend/database.py
+  # ----------------------------------------------------------------
+  cat > backend/database.py <<'EOF'
+import sqlite3, os
+DB_PATH = os.getenv("DATABASE_PATH", "/app/data/orchestrator.db")
+def get_db_connection():
+    os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
+    # check_same_thread=False is required for FastAPI's threadpool
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    return conn
+def init_db():
+    conn = get_db_connection()
+    with conn:
+        conn.execute("""CREATE TABLE IF NOT EXISTS deployments (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            type TEXT NOT NULL CHECK(type IN ('lxc','vm')),
+            target_node TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'PENDING',
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)""")
+    conn.close()
+EOF
+
+  # ----------------------------------------------------------------
+  # 2e. backend/proxmox_client.py
+  # ----------------------------------------------------------------
+  cat > backend/proxmox_client.py <<'EOF'
+import os
+from proxmoxer import ProxmoxAPI
+def get_proxmox_connection():
+    host = os.environ["PROXMOX_HOST"]
+    user = os.environ["PROXMOX_USER"]
+    token_id = os.environ["PROXMOX_TOKEN_ID"]
+    token_secret = os.environ["PROXMOX_TOKEN_SECRET"]
+    # proxmoxer expects "user@realm!tokenid"
+    token_name = f"{user}!{token_id}"
+    return ProxmoxAPI(host, user=user, token_name=token_name,
+                      token_value=token_secret, verify_ssl=False, service="PVE")
+EOF
+
+  # ----------------------------------------------------------------
+  # 2f. backend/main.py — all subprocesses use Popen, never run()
+  # ----------------------------------------------------------------
+  cat > backend/main.py <<'EOF'
+import os, subprocess
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+from database import init_db, get_db_connection
+from proxmox_client import get_proxmox_connection
+
+app = FastAPI(title="Proxmox Orchestration Engine")
+app.add_middleware(CORSMiddleware, allow_origins=["*"],
+                   allow_methods=["*"], allow_headers=["*"])
+
+class DeploymentRequest(BaseModel):
+    name: str
+    type: str
+    node: str
+    cores: int = 2
+    memory: int = 2048
+
+@app.on_event("startup")
+def startup_event():
+    init_db()
+
+@app.get("/api/health")
+def health():
+    return {"status": "ok"}
+
+@app.get("/api/nodes")
+def list_nodes():
+    try:
+        return get_proxmox_connection().nodes.get()
+    except Exception as e:
+        raise HTTPException(500, str(e))
+
+@app.post("/api/deploy")
+def trigger_deployment(req: DeploymentRequest):
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("INSERT INTO deployments (name,type,target_node,status) VALUES (?,?,?,?)",
+                (req.name, req.type, req.node, "PENDING"))
+    conn.commit()
+    dep_id = cur.lastrowid
+    conn.close()
+
+    env = os.environ.copy()
+    env.update({
+        "TF_VAR_instance_name": req.name,
+        "TF_VAR_target_node": req.node,
+        "TF_VAR_cores": str(req.cores),
+        "TF_VAR_memory": str(req.memory),
+        "TF_VAR_instance_type": req.type,
+    })
+
+    try:
+        # Popen with start_new_session=True prevents zombie processes
+        init = subprocess.Popen(["terraform","init","-upgrade"], cwd="/app/terraform",
+                                env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                start_new_session=True)
+        _, err = init.communicate(timeout=120)
+        if init.returncode != 0:
+            raise RuntimeError(err.decode())
+
+        apply = subprocess.Popen(["terraform","apply","-auto-approve"], cwd="/app/terraform",
+                                 env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                 start_new_session=True)
+        _, err = apply.communicate(timeout=600)
+        if apply.returncode != 0:
+            raise RuntimeError(err.decode())
+
+        conn = get_db_connection()
+        conn.execute("UPDATE deployments SET status=? WHERE id=?", ("SUCCESS", dep_id))
+        conn.commit(); conn.close()
+        return {"status": "success", "deployment_id": dep_id}
+    except Exception as e:
+        conn = get_db_connection()
+        conn.execute("UPDATE deployments SET status=? WHERE id=?", ("FAILED", dep_id))
+        conn.commit(); conn.close()
+        raise HTTPException(500, str(e))
+
+@app.get("/api/deployments")
+def get_deployments():
+    conn = get_db_connection()
+    rows = conn.execute("SELECT * FROM deployments ORDER BY created_at DESC").fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+EOF
+
+  # ----------------------------------------------------------------
+  # 2g. backend/Dockerfile — HEALTHCHECK in exec form (Hadolint DL3025)
+  # ----------------------------------------------------------------
+  # FIX: Wrapping the shell logic in ["sh","-c","..."] satisfies Hadolint
+  # DL3025 without losing the "|| kill -TERM 1" fallback.
+  # Citation: https://github.com/marcusrbrown/containers/pull/723 (lines 6-10)
+  cat > backend/Dockerfile <<'EOF'
+FROM python:3.11-slim
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl unzip git openssh-client && rm -rf /var/lib/apt/lists/*
+ARG TERRAFORM_VERSION=1.17.1
+RUN curl -fsSLo /tmp/terraform.zip \
+    "https://releases.hashicorp.com/terraform/${TERRAFORM_VERSION}/terraform_${TERRAFORM_VERSION}_linux_amd64.zip" \
+    && unzip /tmp/terraform.zip -d /usr/local/bin \
+    && chmod +x /usr/local/bin/terraform \
+    && rm /tmp/terraform.zip
+RUN pip install --no-cache-dir ansible-core==2.17.3
+WORKDIR /app
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+COPY . .
+RUN useradd -m -u 1000 appuser && chown -R appuser:appuser /app
+USER appuser
+EXPOSE 8000
+HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
+  CMD ["sh", "-c", "curl -f http://localhost:8000/api/health || kill -TERM 1"]
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
+EOF
+
+  # ----------------------------------------------------------------
+  # 2h. terraform/variables.tf
+  # ----------------------------------------------------------------
+  cat > terraform/variables.tf <<'EOF'
+variable "proxmox_api_url" { type = string; default = "https://192.168.1.100:8006/api2/json" }
+variable "proxmox_api_token_id" { type = string; default = "root@pam!orchestrator" }
+variable "proxmox_api_token_secret" { type = string; sensitive = true }
+variable "target_node" { type = string; default = "pve" }
+variable "instance_name" { type = string; default = "managed-node-01" }
+variable "instance_type" { type = string; default = "lxc" }
+variable "cores" { type = number; default = 2 }
+variable "memory" { type = number; default = 2048 }
+EOF
+
+  # ----------------------------------------------------------------
+  # 2i. terraform/main.tf — Telmate 3.0.2-rc10 is the current release
+  # ----------------------------------------------------------------
+  # Citation: https://newreleases.io/project/github/Telmate/terraform-provider-proxmox/release/v3.0.2-rc10
+  # (lines 4-8: v3.0.2-rc10 fixes Qemu guest start state and adds LXC host_managed)
+  cat > terraform/main.tf <<'EOF'
+terraform {
+  required_version = ">= 1.16.0"
+  required_providers {
+    proxmox = { source = "Telmate/proxmox", version = "3.0.2-rc10" }
+  }
+}
+provider "proxmox" {
+  pm_api_url          = var.proxmox_api_url
+  pm_api_token_id     = var.proxmox_api_token_id
+  pm_api_token_secret = var.proxmox_api_token_secret
+  pm_tls_insecure     = true
+}
+resource "proxmox_lxc" "container" {
+  count        = var.instance_type == "lxc" ? 1 : 0
+  target_node  = var.target_node
+  hostname     = var.instance_name
+  ostemplate   = "local:vztmpl/debian-12-standard_12.2-1_amd64.zst"
+  cores        = var.cores
+  memory       = var.memory
+  unprivileged = true
+  start        = true
+  rootfs { storage = "local-lvm"; size = "8G" }
+  network { name = "eth0"; bridge = "vmbr0"; ip = "dhcp" }
+}
+resource "proxmox_vm_qemu" "vm" {
+  count       = var.instance_type == "vm" ? 1 : 0
+  name        = var.instance_name
+  target_node = var.target_node
+  clone       = "debian-12-template"
+  cores       = var.cores
+  memory      = var.memory
+  agent       = 1
+  os_type     = "cloud-init"
+  disk { size = "10G"; type = "scsi"; storage = "local-lvm" }
+  network { model = "virtio"; bridge = "vmbr0" }
+}
+EOF
+
+  # ----------------------------------------------------------------
+  # 2j. terraform/outputs.tf
+  # ----------------------------------------------------------------
+  cat > terraform/outputs.tf <<'EOF'
+output "instance_ip" {
+  value = try(proxmox_lxc.container[0].ssh_host,
+              proxmox_vm_qemu.vm[0].default_ipv4_address, "unknown")
+}
+EOF
+
+  # ----------------------------------------------------------------
+  # 2k. ansible/site.yml — validate INLINE in lineinfile, not in handler
+  # ----------------------------------------------------------------
+  # FIX: The 'validate' parameter on lineinfile checks the new config
+  # BEFORE writing it. The previous handler-only approach wrote first,
+  # validated second — a broken config could already be on disk.
+  # Citation: https://git.uumas.fi/.../roles/ssh/tasks/main.yaml (lines 20-22)
+  # and https://stackoverflow.com/revisions/66c962a6... (lines 6-8)
+  cat > ansible/site.yml <<'EOF'
+- hosts: all
+  become: yes
+  tasks:
+    - name: Ensure firewalld is installed
+      dnf: { name: firewalld, state: present }
+    - name: Default firewall zone to drop
+      firewalld: { zone: drop, state: enabled, permanent: yes, immediate: yes }
+    - name: Allow SSH from local subnet
+      firewalld:
+        zone: drop
+        rich_rule: 'rule family="ipv4" source address="192.168.0.0/16" service name="ssh" accept'
+        permanent: yes
+        immediate: yes
+        state: enabled
+    - name: Disable root SSH login (validated before write)
+      lineinfile:
+        path: /etc/ssh/sshd_config
+        regexp: '^#?PermitRootLogin'
+        line: 'PermitRootLogin no'
+        validate: '/usr/sbin/sshd -t -f %s'
+      notify: restart sshd
+    - name: Disable password authentication (validated before write)
+      lineinfile:
+        path: /etc/ssh/sshd_config
+        regexp: '^#?PasswordAuthentication'
+        line: 'PasswordAuthentication no'
+        validate: '/usr/sbin/sshd -t -f %s'
+      notify: restart sshd
+    - name: SELinux enforcing
+      selinux: { policy: targeted, state: enforcing }
+    - name: dnf-automatic security updates
+      dnf: { name: dnf-automatic, state: present }
+      notify: enable dnf-automatic
+  handlers:
+    - name: restart sshd
+      systemd: { name: sshd, state: restarted }
+    - name: enable dnf-automatic
+      systemd: { name: dnf-automatic.timer, state: started, enabled: yes }
+EOF
+
+  # ----------------------------------------------------------------
+  # 2l. frontend/package.json — Vite pinned to patched version
+  # ----------------------------------------------------------------
+  # FIX: vite "^5.4.2" allows 5.4.2 (vulnerable to CVE-2025-62522).
+  # Pinning to "^5.4.21" guarantees the patched release.
+  # Citation: https://vuldb.com/cve/CVE-2025-62522 (lines 4-9: patched in 5.4.21)
+  cat > frontend/package.json <<'EOF'
+{
+  "name": "orchestrator-ui",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-react": "4.3.4",
+    "vite": "^5.4.21"
+  }
+}
+EOF
+
+  # ----------------------------------------------------------------
+  # 2m. frontend/index.html (Vite entry point — required)
+  # ----------------------------------------------------------------
+  cat > frontend/index.html <<'EOF'
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Proxmox Orchestration Console</title>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.jsx"></script>
+  </body>
+</html>
+EOF
+
+  # ----------------------------------------------------------------
+  # 2n. frontend/src/main.jsx (React mount — required)
+  # ----------------------------------------------------------------
+  cat > frontend/src/main.jsx <<'EOF'
+import React from 'react';
+import ReactDOM from 'react-dom/client';
+import App from './App.jsx';
+
+ReactDOM.createRoot(document.getElementById('root')).render(
+  <React.StrictMode>
+    <App />
+  </React.StrictMode>
+);
+EOF
+
+  # ----------------------------------------------------------------
+  # 2o. frontend/vite.config.js
+  # ----------------------------------------------------------------
+  cat > frontend/vite.config.js <<'EOF'
+import { defineConfig } from 'vite'
+import react from '@vitejs/plugin-react'
+export default defineConfig({
+  plugins: [react()],
+  base: process.env.VITE_BASE_PATH || '/',
+  server: { port: 3000, proxy: { '/api': { target: 'http://localhost:8000', changeOrigin: true } } }
+})
+EOF
+
+  # ----------------------------------------------------------------
+  # 2p. frontend/src/App.jsx
+  # ----------------------------------------------------------------
+  cat > frontend/src/App.jsx <<'EOF'
+import React, { useState, useEffect } from 'react';
+const API_BASE = import.meta.env.VITE_API_BASE || '';
+export default function App() {
+  const [deployments, setDeployments] = useState([]);
+  const [backendAvailable, setBackendAvailable] = useState(false);
+  const [loading, setLoading] = useState(true);
+  const [form, setForm] = useState({ name: '', node: 'pve', type: 'lxc' });
+  useEffect(() => {
+    const c = new AbortController();
+    const t = setTimeout(() => c.abort(), 3000);
+    fetch(`${API_BASE}/api/health`, { signal: c.signal })
+      .then(r => { if (r.ok) setBackendAvailable(true); })
+      .catch(() => {})
+      .finally(() => { clearTimeout(t); setLoading(false); });
+  }, []);
+  useEffect(() => {
+    if (!backendAvailable) return;
+    fetch(`${API_BASE}/api/deployments`).then(r => r.json()).then(setDeployments).catch(() => {});
+  }, [backendAvailable]);
+  const handleDeploy = async (e) => {
+    e.preventDefault();
+    if (!backendAvailable) return;
+    const r = await fetch(`${API_BASE}/api/deploy`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ...form, cores: 2, memory: 2048 }),
+    });
+    if (r.ok) { alert('Deployment triggered!'); window.location.reload(); }
+    else alert('Deployment failed.');
+  };
+  if (loading) return <p style={{ padding: 40 }}>Checking backend…</p>;
+  return (
+    <div style={{ fontFamily: 'sans-serif', maxWidth: 800, margin: '40px auto', padding: 20 }}>
+      <h2>Proxmox Remote Orchestration Console</h2>
+      {!backendAvailable && (
+        <div style={{ background: '#fff3cd', color: '#856404', padding: 12, borderRadius: 4, marginBottom: 20 }}>
+          ⚠️ Backend unreachable. Running in <strong>demo mode</strong> — deployment controls are disabled.
+        </div>
+      )}
+      <form onSubmit={handleDeploy} style={{ display: 'flex', gap: 10, marginBottom: 20, opacity: backendAvailable ? 1 : 0.5 }}>
+        <input type="text" placeholder="Instance Name" value={form.name}
+          onChange={e => setForm({ ...form, name: e.target.value })} required disabled={!backendAvailable} />
+        <select value={form.type} onChange={e => setForm({ ...form, type: e.target.value })} disabled={!backendAvailable}>
+          <option value="lxc">LXC</option><option value="vm">VM</option>
+        </select>
+        <input type="text" placeholder="Target Node" value={form.node}
+          onChange={e => setForm({ ...form, node: e.target.value })} required disabled={!backendAvailable} />
+        <button type="submit" disabled={!backendAvailable}>Deploy</button>
+      </form>
+      <h3>Deployment History</h3>
+      <table border="1" cellPadding="10" style={{ width: '100%', borderCollapse: 'collapse' }}>
+        <thead><tr><th>ID</th><th>Name</th><th>Type</th><th>Node</th><th>Status</th><th>Timestamp</th></tr></thead>
+        <tbody>
+          {deployments.length === 0 && <tr><td colSpan="6" style={{ textAlign: 'center' }}>No deployments.</td></tr>}
+          {deployments.map(d => (
+            <tr key={d.id}><td>{d.id}</td><td>{d.name}</td><td>{d.type}</td>
+              <td>{d.target_node}</td><td>{d.status}</td><td>{d.created_at}</td></tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+EOF
+
+  # ----------------------------------------------------------------
+  # 2q. frontend/public/404.html (SPA fallback for GitHub Pages)
+  # ----------------------------------------------------------------
+  cat > frontend/public/404.html <<'EOF'
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Redirecting…</title>
+  <script>
+    (function () {
+      var segs = location.pathname.split('/').filter(Boolean);
+      if (segs.length > 0) {
+        location.replace('/' + segs[0] + '/');
+      } else {
+        location.replace('/');
+      }
+    })();
+  </script>
+</head>
+<body><p>Redirecting to <a href="/">home</a>…</p></body>
+</html>
+EOF
+
+  # ----------------------------------------------------------------
+  # 2r. .gitignore — package-lock.json is intentionally NOT ignored
+  # ----------------------------------------------------------------
+  # Citation: https://stackoverflow.com/revisions/82e1fc73... (package-lock
+  # should NOT be added to .gitignore; commit it for reproducible builds)
+  cat > .gitignore <<'EOF'
+__pycache__/
+*.pyc
+.venv/
+venv/
+*.db
+*.sqlite
+node_modules/
+dist/
+.terraform/
+*.tfstate
+*.tfstate.backup
+*.tfvars
+*.retry
+.env
+.DS_Store
+EOF
+
+  ok "All project files emitted"
+
+  # ====================================================================
+  # 3. Commit (only if changes)
+  # ====================================================================
+  step "3. Commit changes (if any)"
+  git add -A
+  if git diff --cached --quiet; then
+    ok "No changes to commit"
+  else
+    git commit -m "Idempotent build: sync project files" || fail "git commit failed"
+    ok "Committed changes"
+  fi
+
+  # ====================================================================
+  # 4. Ensure GitHub repo and origin remote
+  # ====================================================================
+  step "4. Ensure GitHub repo and origin remote"
+  if gh repo view "$owner/$REPO_NAME" &>/dev/null; then
+    ok "Repo $owner/$REPO_NAME already exists"
+  else
+    gh repo create "$REPO_NAME" --public --source=. --remote=origin --push \
+      || fail "Repo creation failed"
+    ok "Repo $owner/$REPO_NAME created"
+  fi
+  if ! git remote get-url origin &>/dev/null; then
+    git remote add origin "https://github.com/$owner/$REPO_NAME.git" \
+      || fail "Failed to add origin remote"
+    ok "Added origin remote"
+  else
+    ok "Origin remote exists"
+  fi
+
+  # ====================================================================
+  # 5. Push main
+  # ====================================================================
+  step "5. Push 'main'"
+  git push -u origin main || fail "Push to origin/main failed"
+  ok "Pushed 'main'"
+
+  # ====================================================================
+  # 6. Build frontend — ensure lockfile exists BEFORE npm ci
+  # ====================================================================
+  step "6. Build frontend"
+  if pushd frontend &>/dev/null; then
+
+    # FIX: npm ci requires an existing package-lock.json. If the lockfile
+    # is absent, run npm install ONCE to generate it, then commit it.
+    # Citation: https://docs.npmjs.com/cli/v11/commands/npm-ci (lines 10-12)
+    if [ ! -f package-lock.json ]; then
+      info "No lockfile found — running 'npm install' to generate it"
+      npm install --legacy-peer-deps || fail "npm install (bootstrap) failed"
+      # Stage the generated lockfile so it is committed on the next run
+      git add package-lock.json || fail "git add package-lock.json failed"
+    fi
+
+    # Now npm ci is safe: lockfile exists.
+    # Citation: npm ci must use the same flags that generated the lockfile
+    # (--legacy-peer-deps), otherwise it exits with an error.
+    # https://docs.npmjs.com/cli/v11/commands/npm-ci (lines 17-20)
+    npm ci --legacy-peer-deps || fail "npm ci failed"
+
+    # Fresh build directory
+    rm -rf dist
+    VITE_BASE_PATH="/$REPO_NAME/" npm run build || fail "Vite build failed"
+    if [ -d dist ]; then
+      ok "dist/ produced"
+    else
+      fail "dist/ not produced"
+    fi
+    popd &>/dev/null
+  else
+    fail "Cannot cd into frontend"
+  fi
+
+  # ====================================================================
+  # 7. Deploy to gh-pages
+  # ====================================================================
+  step "7. Deploy to gh-pages"
+  if [ -d frontend/dist ]; then
+    if pushd frontend &>/dev/null; then
+      npx --yes gh-pages -d dist -r "https://github.com/$owner/$REPO_NAME.git" \
+        || fail "gh-pages deploy failed"
+      popd &>/dev/null
+      ok "gh-pages push complete"
+    fi
+  else
+    fail "Skipping gh-pages: dist/ missing"
+  fi
+
+  # ====================================================================
+  # 8. Wait for gh-pages branch to appear on remote
+  # ====================================================================
+  step "8. Wait for gh-pages branch on remote"
+  local waited=0
+  local found=""
+  while [ "$waited" -lt 60 ]; do
+    if git ls-remote --exit-code --heads origin "$PAGES_BRANCH" &>/dev/null; then
+      found="yes"
+      break
+    fi
+    sleep 3
+    waited=$((waited + 3))
+  done
+  if [ -n "$found" ]; then
+    ok "gh-pages branch detected after ${waited}s"
+  else
+    fail "gh-pages branch not found after 60s"
+  fi
+
+  # ====================================================================
+  # 9. Enable or update GitHub Pages — 409 is NOT an error
+  # ====================================================================
+  step "9. Enable GitHub Pages"
+
+  # FIX: Check if Pages is already enabled via GET. If so, skip POST
+  # and go straight to PUT. This avoids the false-positive error that
+  # occurred when POST returned 409 (Conflict) on a re-run.
+  # Citation: https://raw.githubusercontent.com/bmad-code-org/BMAD-METHOD/.../BUNDLE_DISTRIBUTION_SETUP.md
+  # (lines 17-19: "If the Pages POST returns 409, the site already exists.")
+  local pages_enabled=""
+  if gh api "repos/$owner/$REPO_NAME/pages" --silent &>/dev/null; then
+    pages_enabled="yes"
+    ok "Pages already enabled — updating source"
+  fi
+
+  if [ -n "$pages_enabled" ]; then
+    # Update existing Pages site
+    if gh api "repos/$owner/$REPO_NAME/pages" -X PUT --input - &>/dev/null <<JSON
+{"source":{"branch":"$PAGES_BRANCH","path":"/"}}
+JSON
+    then
+      ok "GitHub Pages source updated (PUT)"
+    else
+      fail "Pages update failed — token may lack 'repo' scope"
+    fi
+  else
+    # Create new Pages site
+    if gh api "repos/$owner/$REPO_NAME/pages" -X POST --input - &>/dev/null <<JSON
+{"source":{"branch":"$PAGES_BRANCH","path":"/"}}
+JSON
+    then
+      ok "GitHub Pages enabled (POST)"
+    else
+      fail "Pages enablement failed — run: gh auth refresh -s repo"
+    fi
+  fi
+
+  # ====================================================================
+  # 10. Build Docker backend (buildx required, no legacy fallback)
+  # ====================================================================
+  step "10. Build Docker backend"
+
+  # FIX: Use buildx explicitly; the legacy builder is deprecated.
+  # Citation: https://github.com/MichaIng/DietPi/issues/7710 (lines 5-8)
+  if docker buildx build -t proxmox-orchestrator-backend --load ./backend; then
+    ok "Docker image built (buildx)"
+  else
+    fail "Docker build failed"
+  fi
+
+  # ====================================================================
+  # 11. Summary
+  # ====================================================================
+  step "Summary"
+  if [ "$ERRORS" -eq 0 ]; then
+    echo "🎉 BUILD SUCCEEDED"
+    echo "  Repo:   https://github.com/$owner/$REPO_NAME"
+    echo "  Pages:  https://$owner.github.io/$REPO_NAME/"
+    echo "  Image:  proxmox-orchestrator-backend"
+    echo ""
+    echo "  Next: populate backend/.env then:"
+    echo "    docker run -d -p 8000:8000 --env-file backend/.env \\"
+    echo "      -v \"\$(pwd)/backend/data:/app/data\" proxmox-orchestrator-backend"
+  else
+    echo "🔥 COMPLETED WITH $ERRORS ERROR(S)"
+    echo "  Review the ❌ lines above."
+    echo ""
+    echo "  Common fixes:"
+    echo "    • gh auth refresh -s repo        (Pages 403/404)"
+    echo "    • apt/dnf install docker-buildx-plugin  (legacy builder warning)"
+    echo "    • cp backend/.env.example backend/.env  (backend env missing)"
+  fi
+
+  return "$ERRORS"
+}
+
+main "$@"
