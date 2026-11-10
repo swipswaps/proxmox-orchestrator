@@ -1,6 +1,8 @@
 import os, subprocess
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse
 from pydantic import BaseModel
 from database import init_db, get_db_connection
 from proxmox_client import get_proxmox_connection, is_proxmox_configured
@@ -22,11 +24,8 @@ def status():
     configured = is_proxmox_configured()
     connected = False; detail = ""
     if configured:
-        try:
-            get_proxmox_connection().version.get()
-            connected = True
-        except Exception as e:
-            detail = f"{type(e).__name__}: {e}"
+        try: get_proxmox_connection().version.get(); connected = True
+        except Exception as e: detail = f"{type(e).__name__}: {e}"
     return {"backend":"ok","proxmox_configured":configured,
             "proxmox_connected":connected,"detail":detail}
 
@@ -73,3 +72,19 @@ def get_deployments():
     conn = get_db_connection()
     rows = conn.execute("SELECT * FROM deployments ORDER BY created_at DESC").fetchall()
     conn.close(); return [dict(r) for r in rows]
+
+# Serve built UI from /app/dist when mounted (see docker-compose.yml volume)
+DIST = "/app/dist"
+if os.path.isdir(DIST):
+    if os.path.isdir(f"{DIST}/assets"):
+        app.mount("/assets", StaticFiles(directory=f"{DIST}/assets"), name="assets")
+
+    @app.get("/")
+    def serve_index():
+        return FileResponse(f"{DIST}/index.html")
+
+    @app.get("/{full_path:path}")
+    def spa_fallback(full_path: str):
+        if full_path.startswith(("api/", "assets/")):
+            raise HTTPException(404)
+        return FileResponse(f"{DIST}/index.html")

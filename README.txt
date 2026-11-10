@@ -1,3 +1,4 @@
-PROXMOX REMOTE ORCHESTRATION ENGINE
-See .env for ports, container names, reuse decisions.
-Monitoring compose is regenerated each build — only non-skipped services appear.
+PROXMOX REMOTE ORCHESTRATION ENGINE — HARDENED BUILD
+====================================================
+See the full README in the repository for detailed instructions.
+This file is a plain-text quick reference.

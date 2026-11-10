@@ -13,8 +13,6 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY . .
 RUN useradd -m -u 1000 appuser && chown -R appuser:appuser /app
 USER appuser
-ENV NO_PROXY=""
-ENV no_proxy=""
 EXPOSE 8000
 HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
   CMD ["sh", "-c", "curl -f http://localhost:8000/api/health || kill -TERM 1"]

@@ -8,11 +8,12 @@ services:
     env_file:
       - backend/.env
     ports:
-      - "${BACKEND_PORT:-8002}:8000"
+      - "${BACKEND_PORT:-8000}:8000"
     volumes:
       - ./backend/data:/app/data
       - ./terraform:/app/terraform
       - ./ansible:/app/ansible
+      - ./frontend/dist:/app/dist:ro
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/api/health"]
       interval: 30s
