@@ -3,7 +3,6 @@ services:
     image: proxmox-orchestrator-backend
     build:
       context: ./backend
-    container_name: proxmox-orchestrator-backend
     restart: unless-stopped
     env_file:
       - backend/.env
@@ -22,7 +21,6 @@ services:
       start_period: 10s
     networks:
       - orchestrator_net
-
 networks:
   orchestrator_net:
     driver: bridge
